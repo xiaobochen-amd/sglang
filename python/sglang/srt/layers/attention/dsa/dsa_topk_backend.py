@@ -12,6 +12,10 @@ _FLASHINFER_TIE_BREAK_VALUES = {
     "large": 2,
 }
 
+# The k values aiter's dsa_topk_transform is instantiated for: DeepSeek-V4's
+# index_topk and GLM-5.2's. Anything else takes the sgl-kernel transform.
+_AITER_TOPK_SUPPORTED_K = frozenset({512, 2048})
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -137,12 +141,12 @@ class DSATopKBackend(Enum):
         # needs the row -> batch map to be the identity. With as many rows as page
         # table rows, cu_seqlens_q_topk is necessarily all-ones and the map is the
         # identity; the expanded shapes (spec verify / draft extend) are not, and
-        # they take the sgl-kernel path. The op is also instantiated for k=2048
-        # only.
+        # they take the sgl-kernel path. The op is instantiated only for the k the
+        # models ask for: 512 is DeepSeek-V4's index_topk, 2048 is GLM-5.2's.
         if (
             self.is_aiter()
             and topk_transform_method == TopkTransformMethod.PAGED
-            and topk == 2048
+            and topk in _AITER_TOPK_SUPPORTED_K
             and batch_idx_list is None
             and lengths.shape[0]
             == logits.shape[0]

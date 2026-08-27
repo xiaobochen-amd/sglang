@@ -20,6 +20,8 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
+    topk_transform_512_aiter,
+    topk_transform_512_aiter_supported,
     topk_transform_512_v2,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
@@ -42,7 +44,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_hip,
+    is_xpu,
+    print_warning_once,
+)
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -399,6 +407,27 @@ def topk_transform_512_flashinfer_unfused(
         },
         contiguous_topk_input=True,
     )
+
+
+def _aiter_topk_usable(
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor],
+) -> bool:
+    if topk_transform_512_aiter_supported(
+        out_page_indices, page_size, out_raw_indices
+    ):
+        return True
+    # Warn rather than fall through quietly: the fallback is correct but runs the
+    # kernel the aiter backend was selected to replace, which silently turns an
+    # A/B measurement into a no-op.
+    print_warning_once(
+        "dsa_topk_backend=aiter cannot serve this top-k "
+        f"(k={out_page_indices.shape[-1]}, page_size={page_size}, "
+        f"raw_indices={'requested' if out_raw_indices is not None else 'unused'}); "
+        "falling back to the sgl-kernel top-k."
+    )
+    return False
 
 
 class C4IndexerBackendMixin:
@@ -825,6 +854,16 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
+            )
+        elif self.dsa_topk_backend.is_aiter() and _aiter_topk_usable(
+            c4_sparse_page_indices, indexer_metadata.c4_page_size, raw_indices
+        ):
+            topk_transform_512_aiter(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
             topk_transform_512_v2(
