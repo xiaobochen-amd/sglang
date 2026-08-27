@@ -64,6 +64,70 @@ def topk_transform_512(
         )
 
 
+# aiter templates its kernel on k, so only the instantiated values are callable.
+_AITER_SUPPORTED_K = frozenset({512, 2048})
+
+
+@cache_once
+def _aiter_dsa_topk_transform():
+    if not is_hip_runtime():
+        return None
+    try:
+        from aiter import dsa_topk_transform
+    except ImportError:
+        return None
+    return dsa_topk_transform
+
+
+def topk_transform_512_aiter_supported(
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor],
+) -> bool:
+    """Whether :func:`topk_transform_512_aiter` can serve this call.
+
+    The aiter kernel emits only the page-mapped slots, so a caller that also
+    wants the pre-transform positions (capture, hisparse swap-in) has to stay on
+    the v1/v2 path.
+    """
+    if _aiter_dsa_topk_transform() is None or out_raw_indices is not None:
+        return False
+    return (
+        out_page_indices.shape[-1] in _AITER_SUPPORTED_K
+        and page_size > 0
+        and (page_size & (page_size - 1)) == 0
+    )
+
+
+def topk_transform_512_aiter(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Fused top-k + page-table transform on aiter's cooperative radix select.
+
+    Same contract as :func:`topk_transform_512` minus ``out_raw_indices``: float32
+    ``scores`` [B, max_seq_len] contiguous along the last dim, int32 ``seq_lens``,
+    int32 ``page_tables`` [B, num_pages], and the winners written into int32
+    ``out_page_indices`` [B, k] with short rows padded to -1.
+    """
+    fn = _aiter_dsa_topk_transform()
+    assert fn is not None, "aiter is unavailable; check topk_transform_512_aiter_supported first"
+    # rowStarts=None means every row starts at 0, which is what decode wants and
+    # saves the per-call zeros tensor.
+    fn(
+        scores,
+        None,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_page_indices.shape[-1],
+    )
+
+
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
 # rows 1..N = {batch_id, seq_len} of items routed to the persistent cluster pool.
 _PLAN_METADATA_INTS_PER_BATCH = 2
