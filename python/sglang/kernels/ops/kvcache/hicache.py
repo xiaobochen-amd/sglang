@@ -20,6 +20,14 @@ _is_hip = is_hip_runtime()
 # ROCm needs a wider grid to saturate mapped-host transfers; CUDA keeps the legacy quota.
 DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
 
+# Mirrors device::kWarpThreads in sgl_kernel/utils.cuh.
+WARP_THREADS = 32
+
+# Copy-round widths, widest first. The narrow rounds admit element sizes 128
+# does not divide, such as MLA's 576 B fp8 row, but only pay off against the
+# ROCm quota above, so CUDA keeps the original 128 B requirement.
+GROUP_BYTES = (128, 64, 32, 16) if _is_hip else (128,)
+
 
 @cache_once
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
@@ -80,11 +88,11 @@ def can_use_hicache_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
+    unroll = unroll or _default_unroll(element_size)
+    if not _tiles_across_lanes(element_size, unroll):
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
-        unroll = unroll or _default_unroll(element_size)
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
         _jit_hicache_module(
             element_size=element_size,
@@ -119,6 +127,17 @@ def can_use_write_back_jit_kernel(
     except Exception as e:
         logger.warning(f"Failed to load staged JIT HiCache kernel: {e}")
         return False
+
+
+def _tiles_across_lanes(element_size: int, unroll: int) -> bool:
+    """Mirror of pick_group_bytes() in kvcacheio/hicache.cuh."""
+    num_threads = WARP_THREADS // unroll
+    return any(
+        group % num_threads == 0
+        and element_size % group == 0
+        and group // num_threads in (4, 8, 16)
+        for group in GROUP_BYTES
+    )
 
 
 def _default_unroll(element_size: int) -> int:
