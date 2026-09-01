@@ -51,10 +51,29 @@ CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cu: TOK_STRIDE (128 K bytes + 4 scale
 Q_LORA_RANK = 2048  # dual_gemv cfg 61, Q half
 HIDDEN_SIZE = 6144  # dual_gemv cfg 61, K half
 QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cu: quant_block_size == head_dim
-# The only per-launch row cap among the four kernels (dual_gemv_bf16.cu).
-# Section A is chunked to it rather than capping the whole path, so larger
-# verify batches stay fused.
+# The only per-launch row cap among the four kernels (dual_gemv_bf16.cu, whose
+# own TORCH_CHECK reads "specialised for M in [1,8]"). Section A is chunked to
+# it rather than capping the whole path, so larger verify batches stay fused.
 DUAL_GEMV_MAX_M = 8
+# ...but every chunk re-reads both weights (w_q_b 16.8 MB + w_kw 2.0 MB), and
+# the GEMV shape stops paying once it is not one or two launches. Measured
+# in-graph on MI355X, us per section-A call, against one torch.mm per
+# projection (w.t() is left lazy -- the native NT layout is 13-25% faster than
+# a materialised transpose and costs no memory):
+#
+#   rows        4     8    10    12    16    24    32    48
+#   launches    1     1     2     2     2     3     4     6
+#   GEMV     6.19  7.47 12.87 13.01 14.36 21.45 28.24 42.24
+#   GEMM    13.73 13.81 15.22 16.78 16.99 17.45 15.28 14.78
+#
+# GEMV scales with the launch count, GEMM is flat; the crossover sits between
+# two and three launches. MTP verify rows are bs x num_draft_tokens, so the
+# stock GLM-5.2 recipe (max-running-requests 4, num-draft-tokens 6) lands on 24
+# -- the wrong side. Above the crossover the two projections go to GEMM, which
+# is both fewer launches and the right shape; nodes 2-4 stay fused either way.
+# Same arithmetic in both branches: this module's header defines section A as
+# exactly these two GEMMs.
+DUAL_GEMV_MAX_PROFITABLE_ROWS = 2 * DUAL_GEMV_MAX_M
 MAX_ROWS = 48  # bs 8 x num_draft_tokens 6
 
 
@@ -308,17 +327,21 @@ class Gfx950FusedIndexer:
         # oq = q_lora @ wq_b.T  (2048 -> 4096)   ok = x @ [wk ; weights_proj].T
         # Exact, not an approximation: one GEMV per row, and the slices keep
         # the stride(0) the binding reads. rows <= 8 stays a single launch.
-        for i in range(0, rows, DUAL_GEMV_MAX_M):
-            j = min(i + DUAL_GEMV_MAX_M, rows)
-            gemv.dual_gemv_bf16(
-                q_lora[i:j],
-                w_q_b,
-                q_proj[i:j],
-                x[i:j],
-                w_kw,
-                kw[i:j],
-                loader.DUAL_GEMV_CFG,
-            )
+        if rows <= DUAL_GEMV_MAX_PROFITABLE_ROWS:
+            for i in range(0, rows, DUAL_GEMV_MAX_M):
+                j = min(i + DUAL_GEMV_MAX_M, rows)
+                gemv.dual_gemv_bf16(
+                    q_lora[i:j],
+                    w_q_b,
+                    q_proj[i:j],
+                    x[i:j],
+                    w_kw,
+                    kw[i:j],
+                    loader.DUAL_GEMV_CFG,
+                )
+        else:
+            torch.mm(q_lora, w_q_b.t(), out=q_proj)
+            torch.mm(x, w_kw.t(), out=kw)
 
         # --- node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
         #             indexer_k_quant_and_cache(k) | head gate ---------------
