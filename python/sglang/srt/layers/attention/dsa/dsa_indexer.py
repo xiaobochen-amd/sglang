@@ -4,6 +4,8 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+import time
+
 import torch
 from einops import rearrange
 
@@ -204,7 +206,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # How long one free-memory reading may stand. mem_get_info is a host sync
+    # of a few tens of microseconds against a decode step of milliseconds, so a
+    # second is far below the noise floor while still tracking the pools filling.
+    _MQA_LOGITS_BUDGET_TTL_S = 1.0
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+    _mqa_logits_budget_read_at: Dict[int, float] = {}
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -1013,6 +1020,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+
+        # The cached budget is one mem_get_info reading, taken on the first
+        # non-capture prefill -- which lands while free memory is collapsing as
+        # the pools fill. On GLM-5.2 that window runs 39.8 GiB -> 5.9 GiB in
+        # about four seconds, so which second the read lands in decides every
+        # later chunking verdict, and the same configuration behaves three ways:
+        #
+        #   read high  budget too large -> a big prefill is not chunked -> the
+        #              allocation fails as HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+        #              an abort inside the HSA queue rather than a catchable
+        #              torch OOM, so the scheduler process dies mid-run
+        #   read low   budget too small -> everything chunks -> decode steps run
+        #              about 2x slower for the life of the process
+        #   in between fine
+        #
+        # A cached figure cannot track that. mem_get_info synchronizes the host,
+        # which is why it was cached, so refresh on a clock instead of dropping
+        # the cache: at most one sync per interval, and the verdict follows the
+        # real figure in both directions rather than only tightening.
+        now = time.monotonic()
+        last = self._mqa_logits_budget_read_at.get(device_index, 0.0)
+        if now - last >= self._MQA_LOGITS_BUDGET_TTL_S:
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
+            logits_budget_bytes = max(
+                1, int(free_mem * self._mqa_logits_free_mem_fraction())
+            )
+            self._mqa_logits_budget_bytes[device_index] = logits_budget_bytes
+            self._mqa_logits_budget_read_at[device_index] = now
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
