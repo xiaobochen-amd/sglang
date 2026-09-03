@@ -354,6 +354,7 @@ DSA_CHOICES = [
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "triton",
     "aiter",
     "trtllm",
 ]
@@ -1794,7 +1795,7 @@ class ServerArgs:
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton' is a gfx950 fused per-query sparse-MLA prefill kernel (fp8 KV).",
             choices=DSA_CHOICES,
             resolvable=True,
         ),
@@ -1803,7 +1804,7 @@ class ServerArgs:
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton' is a gfx950 split-K sparse-MLA decode kernel (fp8 KV), 1.56x TileLang over the MTP token counts; it tunes its own tiling from the token and head count.",
             choices=DSA_CHOICES,
             resolvable=True,
         ),

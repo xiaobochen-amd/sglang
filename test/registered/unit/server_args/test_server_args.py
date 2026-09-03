@@ -706,6 +706,32 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_accepts_triton_prefill_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="triton",
+            dsa_decode_backend="tilelang",
+        )
+
+        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_accepts_triton_decode_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="triton",
+            dsa_decode_backend="triton",
+        )
+
+        server_args._validate_hisparse_dsa_backend("dsa_prefill_backend", "prefill")
+        server_args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
