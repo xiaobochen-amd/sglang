@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from enum import Enum, IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
@@ -202,6 +203,21 @@ class DSATopKBackend(Enum):
                 pt_row_map=pt_row_map,
             )
 
+        if (
+            self.is_aiter()
+            and topk_transform_method == TopkTransformMethod.RAGGED
+            and topk == 2048
+            and topk_indices_offset is not None
+            and _aiter_ragged_topk_available()
+        ):
+            return _topk_transform_aiter_ragged(
+                logits,
+                lengths,
+                topk_indices_offset,
+                topk,
+                row_starts=row_starts,
+            )
+
         if self.is_sgl_kernel() or self.is_aiter():
             from sgl_kernel import (
                 fast_topk_transform_fused,
@@ -353,6 +369,81 @@ def _aiter_pt_row_map(
     ):
         return _AITER_ROWS_UNSUPPORTED
     return batch_idx_list
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_ragged_topk_available() -> bool:
+    """True iff aiter's prefill top-k can be asked for a deterministic emit.
+
+    Eight TP ranks run this on the same logits and must select the same KV set.
+    The multi-block path resolves an exact tie by whichever block arrives first,
+    and at 335k context ties are not hypothetical: one row in 1605 hit one when
+    this was measured against the shipped transform. Older aiter has no ``stable``
+    argument, so there the RAGGED path stays on sgl-kernel.
+    """
+    try:
+        import inspect
+
+        from aiter.ops.topk import top_k_per_row_prefill
+    except ImportError:
+        return False
+    return "stable" in inspect.signature(top_k_per_row_prefill).parameters
+
+
+def _topk_transform_aiter_ragged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk_indices_offset: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-row top-k for RAGGED prefill via aiter's ``top_k_per_row_prefill``.
+
+    Returns ``(num_rows, topk)`` int32, ``-1`` padded, identical in meaning to
+    ``fast_topk_transform_ragged_fused``: a position in the batch's flattened KV,
+    i.e. the row-local winner plus that row's sequence offset.
+
+    RAGGED has no page table to fold in, so this is the select half of
+    ``_topk_transform_aiter_paged`` plus one elementwise add over
+    ``(num_rows, topk)`` int32 -- 13 MB at the production shape, against the
+    2.15 GB score buffer the select itself reads.
+
+    Measured on MI355X at the GLM-5.2 agentic shape (1605 rows x 335k context,
+    k=2048): 2.57 ms for the sgl-kernel transform against 1.31 ms here, 1.96x,
+    27.6 ms a prefill across the 22 indexer layers. The two disagree on one row
+    in 1605, where two positions hold the same fp32 score and each kernel keeps a
+    different one; both are a correct top-k.
+    """
+    import aiter
+
+    assert (
+        logits.dtype == torch.float32 and logits.stride(1) == 1
+    ), f"aiter top-k expects fp32 scores with unit row stride, got {logits.dtype=} {logits.stride()=}"
+
+    num_rows = logits.shape[0]
+    lengths_i32 = lengths.to(dtype=torch.int32)
+    if row_starts is None:
+        row_starts = logits.new_zeros(num_rows, dtype=torch.int32)
+        row_ends = lengths_i32
+    else:
+        row_starts = row_starts.to(dtype=torch.int32)
+        row_ends = row_starts + lengths_i32
+
+    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
+    aiter.ops.topk.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        out,
+        None,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        topk,
+        True,
+    )
+    offset = topk_indices_offset[:num_rows].to(dtype=torch.int32).unsqueeze(1)
+    return torch.where(out >= 0, out + offset, out)
 
 
 def _topk_transform_aiter_paged(
