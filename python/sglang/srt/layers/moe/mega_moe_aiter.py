@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 import torch
 from sglang.srt.distributed.parallel_state import get_moe_ep_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
@@ -64,6 +66,13 @@ def mega_moe_aiter_available() -> bool:
 
 def get_mega_moe_mtpr() -> int:
     return int(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get())
+
+
+def _get_collective_token_span(num_tokens: int) -> int:
+    global_num_tokens = get_dp_global_num_tokens()
+    if global_num_tokens and not is_dsa_enable_prefill_cp():
+        num_tokens = max(num_tokens, max(global_num_tokens))
+    return max(1, num_tokens)
 
 
 def _validate_mtpr(mtpr: int) -> None:
@@ -346,6 +355,7 @@ def run_mega_moe_aiter_routed(
             "BaseRunner.warmup() must run before eager execution or graph capture."
         )
     is_empty = hidden_states.shape[0] == 0
+    collective_tokens = _get_collective_token_span(num_tokens)
     if is_empty:
         # MegaMoEV2 is an EP collective: idle DP-attention ranks still must
         # participate, but its config selector rejects zero tokens. Dispatch a
@@ -375,7 +385,12 @@ def run_mega_moe_aiter_routed(
     )
 
     with torch.inference_mode(False), torch.no_grad():
-        y = mega.forward(hidden_states.contiguous(), topk_weights, topk_ids)
+        y = mega.forward(
+            hidden_states.contiguous(),
+            topk_weights,
+            topk_ids,
+            collective_tokens_per_rank=collective_tokens,
+        )
 
     if is_empty:
         return y[:0]

@@ -319,12 +319,20 @@ def test_empty_dp_attention_batch_participates_with_dummy_token(monkeypatch):
     forwarded = {}
 
     class FakeMega:
-        def forward(self, hidden_states, topk_weights, topk_ids):
+        def forward(
+            self,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            *,
+            collective_tokens_per_rank,
+        ):
             forwarded["shapes"] = (
                 hidden_states.shape,
                 topk_weights.shape,
                 topk_ids.shape,
             )
+            forwarded["collective_tokens"] = collective_tokens_per_rank
             assert torch.count_nonzero(topk_weights) == 0
             return torch.zeros_like(hidden_states)
 
@@ -372,3 +380,13 @@ def test_empty_dp_attention_batch_participates_with_dummy_token(monkeypatch):
         torch.Size((1, 7)),
         torch.Size((1, 7)),
     )
+    assert forwarded["collective_tokens"] == 1
+
+
+def test_collective_token_span_uses_dp_global_max(monkeypatch):
+    import sglang.srt.layers.moe.mega_moe_aiter as mega
+
+    monkeypatch.setattr(mega, "get_dp_global_num_tokens", lambda: [257, 1])
+    monkeypatch.setattr(mega, "is_dsa_enable_prefill_cp", lambda: False)
+
+    assert mega._get_collective_token_span(1) == 257
