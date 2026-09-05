@@ -22,10 +22,8 @@ def _sort_reference(probs, top_ps):
 def test_no_worse_than_the_pivot_kernel(rows, temperature):
     """Both keep every element tied with tau, so both differ from a sort the same
     way; what must hold is that the split is never the less accurate of the two."""
-    from sglang.srt.speculative.eagle_utils import (
-        _top_p_renorm_kernel,
-        _top_p_renorm_split,
-    )
+    from sglang.kernels.ops.speculative.top_p_renorm import top_p_renorm_split
+    from sglang.srt.speculative.eagle_utils import _top_p_renorm_kernel
 
     torch.manual_seed(rows * 10 + int(temperature * 10))
     probs = torch.softmax(
@@ -34,7 +32,7 @@ def test_no_worse_than_the_pivot_kernel(rows, temperature):
     top_ps = (0.05 + 0.94 * torch.rand(rows, device="cuda")).float()
 
     ref = _sort_reference(probs, top_ps)
-    split = _top_p_renorm_split(probs, top_ps)
+    split = top_p_renorm_split(probs, top_ps)
     shipped = torch.empty_like(probs)
     _top_p_renorm_kernel[(rows,)](
         probs, shipped, top_ps, VOCAB, BLOCK=4096, N_ITER=30
@@ -48,14 +46,14 @@ def test_no_worse_than_the_pivot_kernel(rows, temperature):
 
 def test_independent_of_the_split_factor():
     """Rows are split across blocks, so the output must not depend on how many."""
-    import sglang.srt.speculative.eagle_utils as eu
+    from sglang.kernels.ops.speculative.top_p_renorm import top_p_renorm_split
 
     torch.manual_seed(3)
     probs = torch.softmax(torch.randn(12, VOCAB, device="cuda") / 0.7, dim=-1)
     top_ps = torch.linspace(0.3, 0.99, 12, device="cuda").float()
-    base = eu._top_p_renorm_split(probs, top_ps)
+    base = top_p_renorm_split(probs, top_ps)
     for _ in range(4):
-        assert torch.equal(eu._top_p_renorm_split(probs, top_ps), base)
+        assert torch.equal(top_p_renorm_split(probs, top_ps), base)
 
 
 @pytest.mark.parametrize("rows", [4, 32, 64])
@@ -69,14 +67,16 @@ def test_wrapper_agrees_with_the_pivot_path(rows):
     top_ps[0] = 1.0  # must pass through unchanged, as CUDA's top_p_renorm_prob does
     top_ks = torch.full((rows,), VOCAB, device="cuda")
 
-    saved = eu._TP_ROW_LIMIT
+    from sglang.kernels.ops.speculative import top_p_renorm as split
+
+    saved = split.ROW_LIMIT
     try:
-        eu._TP_ROW_LIMIT = 0
+        split.ROW_LIMIT = 0
         off = eu._renorm_top_k_top_p_hip(probs, top_ks, top_ps, need_top_k=False)
-        eu._TP_ROW_LIMIT = rows
+        split.ROW_LIMIT = rows
         on = eu._renorm_top_k_top_p_hip(probs, top_ks, top_ps, need_top_k=False)
     finally:
-        eu._TP_ROW_LIMIT = saved
+        split.ROW_LIMIT = saved
 
     assert torch.equal(on[0], probs[0])
     torch.testing.assert_close(on, off, atol=1e-5, rtol=0)
