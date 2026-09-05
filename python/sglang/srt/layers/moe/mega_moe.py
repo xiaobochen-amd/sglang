@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_mega_moe = _use_aiter and is_gfx95_supported()
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -103,6 +107,8 @@ def _get_mega_moe_symm_buffer(
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
+    if _use_aiter_mega_moe:
+        return getattr(moe.experts, "_aiter_mega_moe_weights_built", False)
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
     if _device_sm == 90:
@@ -164,8 +170,6 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
-    import deep_gemm
-
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
@@ -192,9 +196,32 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
+    top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
+    if num_tokens == 0:
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+    else:
+        topk_ids_in = topk_ids.to(torch.int32)
+        topk_weights_in = topk_weights.to(torch.float32)
+
+    if _use_aiter_mega_moe:
+        from sglang.srt.layers.moe.mega_moe_aiter import run_aiter_mega_moe
+
+        y = run_aiter_mega_moe(
+            moe,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            forward_batch,
+        )
+        if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+            y.mul_(moe.routed_scaling_factor)
+        return y
+
+    import deep_gemm
+
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
-    top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -214,13 +241,6 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
-
-    if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
-        topk_weights_in = topk_weights.to(torch.float32)
-    else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
-        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
     if _device_sm == 90:
         return run_sm90_mega_routed(

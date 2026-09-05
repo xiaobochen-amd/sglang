@@ -1040,6 +1040,14 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
 
     # ===================================================================
+    # AITER MegaMoEV2 (ROCm gfx95x)
+    # ===================================================================
+    # Decode includes EAGLE target-verify rows. Prefill is capped by AITER's
+    # largest static token bucket; both values must be powers of two.
+    SGLANG_AITER_MEGA_MOE_DECODE_MAX_TOKENS_PER_RANK = EnvInt(256)
+    SGLANG_AITER_MEGA_MOE_PREFILL_MAX_TOKENS_PER_RANK = EnvInt(32768)
+
+    # ===================================================================
     # Top-k kernels
     # ===================================================================
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

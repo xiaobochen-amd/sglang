@@ -1447,6 +1447,12 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        if _use_aiter and get_moe_a2a_backend().is_megamoe():
+            return "AITER MegaMoEV2 executes routed experts only."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
+
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # The loader rewrites the draft arch to this name, so the inherited
@@ -1458,6 +1464,12 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # exclude_layers remapping for the MTP layer is handled explicitly in
     # _resolve_nextn_quant_config below instead.
     hf_to_sglang_mapper = WeightsMapper()
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        if _use_aiter and get_moe_a2a_backend().is_megamoe():
+            return "AITER MegaMoEV2 executes routed experts only."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
 
