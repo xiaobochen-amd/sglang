@@ -201,6 +201,20 @@ class HostKVCache(abc.ABC):
                 if buf is not None:
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
+        # Dropping the reference is not enough on ROCm. There the pool comes
+        # from torch's pinned allocator (see alloc_with_host_register: hipHost-
+        # Register hands back a device address that differs from the host one,
+        # which the HiCache transfer kernels cannot use), and that allocator
+        # caches its blocks -- freeing the tensor returns the block to the cache
+        # and never calls hipHostFree. The pages stay pinned until the process
+        # dies, and the kernel then unpins the whole pool during teardown.
+        # Measured on an MI355X box: a TP=8 server holding 235 GB of host pool a
+        # rank took 32 minutes to release its GPUs after `docker stop` returned,
+        # in long stalls and sudden drops, which is the kernel doing that work
+        # with the container already gone. Emptying the cache here does it in
+        # userspace instead, at ~17 GB/s measured (8 GB in 0.47 s).
+        if self.pin_memory and _is_hip and hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
 
     @abc.abstractmethod
     def get_size_per_token(self):
