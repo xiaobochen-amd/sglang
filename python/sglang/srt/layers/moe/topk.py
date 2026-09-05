@@ -2144,6 +2144,13 @@ def select_experts(
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
+    # Per-rank shared slots are appended after routing. Do not emit a second
+    # shared marker from the gate.
+    num_fused_shared_experts_for_gate = (
+        0
+        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        else num_fused_shared_experts
+    )
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
@@ -2199,7 +2206,7 @@ def select_experts(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
@@ -2262,7 +2269,7 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 **_fused_topk_kwargs,

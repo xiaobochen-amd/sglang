@@ -17,10 +17,9 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -33,10 +32,19 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
+
+def _use_aiter_mega_moe() -> bool:
+    # HIP + megamoe always takes the AITER MegaMoEV2 path. Missing MegaMoEV2
+    # should fail at import/weight-build, not silently fall back to DeepGEMM.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
+
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
-
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
@@ -105,9 +113,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if _device_sm == 90:
-        if not is_sm90_fp8_mega_moe_available(moe.experts):
-            return False
+    if (
+        _device_sm == 90
+        and not _is_hip
+        and not is_sm90_fp8_mega_moe_available(moe.experts)
+    ):
+        return False
     if get_is_capture_mode():
         return True
 
@@ -117,14 +128,21 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank <= cap:
+        return True
+    if _use_aiter_mega_moe():
+        raise ValueError(
+            f"MegaMoE on ROCm requires max tokens per rank ({max_tokens_per_rank}) "
+            f"not to exceed the configured capacity ({cap})"
+        )
+    return False
 
 
 def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional[ForwardBatch] = None,
-    input_ids_global: Optional[torch.Tensor] = None,
+    forward_batch: ForwardBatch | None = None,
+    input_ids_global: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
 
@@ -160,12 +178,22 @@ def forward_mega_moe(
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional[ForwardBatch],
-    input_ids_global: Optional[torch.Tensor],
+    forward_batch: ForwardBatch | None,
+    input_ids_global: torch.Tensor | None,
     num_tokens: int,
 ) -> torch.Tensor:
-    import deep_gemm
+    if _use_aiter_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_aiter import run_mega_moe_aiter_routed
 
+        return run_mega_moe_aiter_routed(
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+        )
+
+    import deep_gemm
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
@@ -318,12 +346,18 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    if _use_aiter_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_aiter import build_mega_moe_aiter_weights
+
+        build_mega_moe_aiter_weights(experts)
+        return
+
     from deep_gemm import (
         transform_sf_into_required_layout,
     )
-
-    if getattr(experts, "_mega_moe_weights_built", False):
-        return
 
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
