@@ -618,9 +618,7 @@ class DeepseekMLARocmForwardMixin:
 
                     q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
                 elif is_kv_b_lora_active(self):
-                    q_nope_out = apply_kv_b_lora_q_correction(
-                        self, q_nope, q_nope_out
-                    )
+                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
