@@ -17,10 +17,9 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -43,9 +42,9 @@ def _use_aiter_mega_moe() -> bool:
     # should fail at import/weight-build, not silently fall back to DeepGEMM.
     return _is_hip and get_moe_a2a_backend().is_megamoe()
 
+
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
-
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
@@ -114,9 +113,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if _device_sm == 90 and not _is_hip:
-        if not is_sm90_fp8_mega_moe_available(moe.experts):
-            return False
+    if (
+        _device_sm == 90
+        and not _is_hip
+        and not is_sm90_fp8_mega_moe_available(moe.experts)
+    ):
+        return False
     if get_is_capture_mode():
         return True
 
@@ -126,14 +128,21 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank <= cap:
+        return True
+    if _use_aiter_mega_moe():
+        raise ValueError(
+            f"MegaMoE on ROCm requires max tokens per rank ({max_tokens_per_rank}) "
+            f"not to exceed the configured capacity ({cap})"
+        )
+    return False
 
 
 def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional[ForwardBatch] = None,
-    input_ids_global: Optional[torch.Tensor] = None,
+    forward_batch: ForwardBatch | None = None,
+    input_ids_global: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
 
@@ -169,8 +178,8 @@ def forward_mega_moe(
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional[ForwardBatch],
-    input_ids_global: Optional[torch.Tensor],
+    forward_batch: ForwardBatch | None,
+    input_ids_global: torch.Tensor | None,
     num_tokens: int,
 ) -> torch.Tensor:
     if _use_aiter_mega_moe():
@@ -185,7 +194,6 @@ def _run_mega_routed(
         )
 
     import deep_gemm
-
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size

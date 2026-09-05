@@ -3634,6 +3634,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_moe_runner_backend_alias()
+        self._handle_moe_runtime_requirements()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
@@ -3819,6 +3820,24 @@ class ServerArgs:
             )
         self.moe_runner_backend = "auto"
         self.moe_a2a_backend = "megamoe"
+
+    def _handle_moe_runtime_requirements(self):
+        if self.moe_a2a_backend != "megamoe" or not is_hip():
+            return
+
+        mtpr = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        if mtpr <= 0 or mtpr & (mtpr - 1):
+            raise ValueError(
+                "MegaMoE on ROCm requires "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to be "
+                f"a positive power of two, got {mtpr}"
+            )
+        if not envs.SGLANG_USE_AITER.get():
+            raise ValueError("MegaMoE on ROCm requires SGLANG_USE_AITER=1")
+        if os.environ.get("MORI_SHMEM_MODE", "").upper() == "ISOLATION":
+            raise ValueError(
+                "MegaMoE on ROCm does not support MORI_SHMEM_MODE=ISOLATION"
+            )
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):

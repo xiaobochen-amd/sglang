@@ -23,10 +23,9 @@ with ``SGLANG_USE_AITER=1``. NVIDIA Blackwell still uses DeepGEMM in
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.distributed.parallel_state import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -196,9 +195,15 @@ def build_mega_moe_aiter_weights(experts) -> None:
             f"weights={local_e}, dispatch={experts.num_local_experts}."
         )
 
-    s1 = experts.w13_weight_scale_inv.data
+    w13_scale = getattr(experts, "w13_weight_scale_inv", None)
+    if w13_scale is None:
+        w13_scale = experts.w13_weight_scale
+    s1 = w13_scale.data
     w2 = experts.w2_weight.data
-    s2 = experts.w2_weight_scale_inv.data
+    w2_scale = getattr(experts, "w2_weight_scale_inv", None)
+    if w2_scale is None:
+        w2_scale = experts.w2_weight_scale
+    s2 = w2_scale.data
 
     experts._mega_w1 = shuffle_weight_a16w4(w13, 16, True).contiguous()
     experts._mega_w1_scale = shuffle_scale_a16w4(
@@ -291,8 +296,8 @@ def _get_or_build_mega_moe(
 def run_mega_moe_aiter_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional[ForwardBatch],
-    input_ids_global: Optional[torch.Tensor],
+    forward_batch: ForwardBatch | None,
+    input_ids_global: torch.Tensor | None,
     num_tokens: int,
 ) -> torch.Tensor:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -309,7 +314,9 @@ def run_mega_moe_aiter_routed(
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(moe, "is_hash", False) else {}
+        )
         topk_output = moe.topk(
             hidden_states,
             router_logits,

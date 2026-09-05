@@ -2144,12 +2144,8 @@ def select_experts(
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
-    # On the per-rank shared-slot path the shared expert is appended afterwards by
-    # fused_append_remap_shared_experts_deepep, so the gate must not also emit a shared
-    # marker. Doing both costs one routed expert (K_routed = topk - num_fused_shared,
-    # so top-6 becomes top-5) and puts the marker at id num_experts, which the DeepEP
-    # remap shifts to one past the end of the expert space (384 -> 392 for 384 routed
-    # experts on EP8, where valid ids are 0..391).
+    # Per-rank shared slots are appended after routing. Do not emit a second
+    # shared marker from the gate.
     num_fused_shared_experts_for_gate = (
         0
         if has_per_rank_fused_shared_slots(num_fused_shared_experts)
