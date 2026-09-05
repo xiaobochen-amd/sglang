@@ -78,6 +78,27 @@ def synchronized(func):
     return wrapper
 
 
+def _release_host_attr(obj, name: str) -> None:
+    """Drop one attribute's host buffers, in a frame that then goes away.
+
+    The last reference has to be gone before destroy() empties the pinned
+    cache, and a local in destroy() itself is a reference: doing this inline
+    left `buffers` pointing at the pool across the _host_emptyCache() call,
+    so the allocator saw the block as live and returned nothing. Measured
+    that way the whole fix was a no-op.
+    """
+    buffers = getattr(obj, name, None)
+    if hasattr(obj, name):
+        setattr(obj, name, None)
+    if buffers is None or not obj.pin_memory or not (_is_cuda or _is_hip):
+        return
+    if not isinstance(buffers, (list, tuple)):
+        buffers = [buffers]
+    for buf in buffers:
+        if buf is not None:
+            _cuda_host_unregister(buf)
+
+
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
@@ -193,26 +214,17 @@ class HostKVCache(abc.ABC):
         if getattr(self, "_destroyed", False):
             return
         self._destroyed = True
-        buffers = getattr(self, "kv_buffer", None)
-        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
-            if not isinstance(buffers, (list, tuple)):
-                buffers = [buffers]
-            for buf in buffers:
-                if buf is not None:
-                    _cuda_host_unregister(buf)
-        self.kv_buffer = None
-        # Dropping the reference is not enough on ROCm. There the pool comes
-        # from torch's pinned allocator (see alloc_with_host_register: hipHost-
-        # Register hands back a device address that differs from the host one,
-        # which the HiCache transfer kernels cannot use), and that allocator
-        # caches its blocks -- freeing the tensor returns the block to the cache
-        # and never calls hipHostFree. The pages stay pinned until the process
-        # dies, and the kernel then unpins the whole pool during teardown.
-        # Measured on an MI355X box: a TP=8 server holding 235 GB of host pool a
-        # rank took 32 minutes to release its GPUs after `docker stop` returned,
-        # in long stalls and sudden drops, which is the kernel doing that work
-        # with the container already gone. Emptying the cache here does it in
-        # userspace instead, at ~17 GB/s measured (8 GB in 0.47 s).
+        # Every attribute that can own host storage, not just kv_buffer.
+        # MLATokenToKVPoolHost under page_first keeps one strided view per layer
+        # in data_refs (pool_host/mla.py), each a strong reference to the same
+        # storage; DSAIndexerPoolHost never assigns kv_buffer at all, its buffer
+        # is index_k_with_scale_buffer (memory_pool_host.py). Clearing only
+        # kv_buffer leaves the pool referenced layer_num times over, the block
+        # never returns to torch's pinned cache, and emptying that cache below
+        # then has nothing to hand back -- which is exactly what an earlier
+        # version of this measured.
+        for name in ("kv_buffer", "data_refs", "index_k_with_scale_buffer"):
+            _release_host_attr(self, name)
         if self.pin_memory and _is_hip and hasattr(torch._C, "_host_emptyCache"):
             torch._C._host_emptyCache()
 
