@@ -696,6 +696,7 @@ def _top_p_renorm_kernel(
         tl.store(out_ptr + base + idx, tl.where(p >= lo, p / Z, 0.0), mask=m)
 
 
+
 def _renorm_top_k_top_p_hip(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -723,10 +724,15 @@ def _renorm_top_k_top_p_hip(
             -1, sorted_indices, sorted_probs
         )
     top_ps = top_ps.reshape(-1).to(torch.float32).contiguous()
-    out = torch.empty_like(probs)
-    _top_p_renorm_kernel[(probs.shape[0],)](
-        probs, out, top_ps, vocab, BLOCK=4096, N_ITER=30
-    )
+    from sglang.kernels.ops.speculative import top_p_renorm as _split
+
+    if probs.shape[0] <= _split.ROW_LIMIT:
+        out = _split.top_p_renorm_split(probs, top_ps)
+    else:
+        out = torch.empty_like(probs)
+        _top_p_renorm_kernel[(probs.shape[0],)](
+            probs, out, top_ps, vocab, BLOCK=4096, N_ITER=30
+        )
     return torch.where((top_ps >= 1.0).view(-1, 1), probs, out)
 
 
