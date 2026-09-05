@@ -68,6 +68,38 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+
+# torch.softmax walks one block per row. A decode-shaped batch against a large
+# vocab then occupies a handful of blocks of the whole GPU: at [6, 154880] it
+# moves 184 GB/s where a copy of the same bytes reaches 2096. Only rows wide
+# enough that torch takes its global-memory path are worth diverting.
+_WIDE_SOFTMAX_MIN_VOCAB = 8192
+
+
+def _softmax_wide(
+    logits: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """softmax(logits, dim=-1), row-parallel when the row is wide enough."""
+    if (
+        logits.ndim == 2
+        and logits.dtype is torch.float32
+        and logits.is_contiguous()
+        and logits.shape[1] >= _WIDE_SOFTMAX_MIN_VOCAB
+    ):
+        from sglang.kernels.ops.speculative.multi_layer_eagle import (
+            wide_row_softmax_triton,
+        )
+
+        return wide_row_softmax_triton(
+            logits, None, out if out is not None else torch.empty_like(logits)
+        )
+    probs = torch.softmax(logits, dim=-1)
+    if out is None:
+        return probs
+    out.copy_(probs)
+    return out
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -208,8 +240,7 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                probs = _softmax_wide(logits, out=logits)
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
@@ -444,7 +475,7 @@ class Sampler(nn.Module):
         Used for the Ascend NPU backend which handles softmax internally.
         """
         if simple_sampling_case:
-            probs = torch.softmax(logits, dim=-1)
+            probs = _softmax_wide(logits)
             if sampling_info.sampling_seed is not None:
                 probabilities = probs.to(torch.float64).log_()
                 batch_next_token_ids = multinomial_with_seed(
@@ -649,7 +680,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
                 logprobs_top_k_top_p, sampling_seed, positions
             )
     else:
-        probs = torch.softmax(logits, dim=-1)
+        probs = _softmax_wide(logits)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
 
         # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
