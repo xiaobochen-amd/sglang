@@ -68,6 +68,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    has_per_rank_fused_shared_slots,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -402,6 +403,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
+        if has_per_rank_fused_shared_slots(self.num_fused_shared_experts):
+            num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
+        else:
+            num_experts_for_moe = (
+                config.n_routed_experts + self.num_fused_shared_experts
+            )
 
         self.config = config
         self.layer_id = layer_id
@@ -422,7 +429,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.n_routed_experts + self.num_fused_shared_experts,
+            num_experts=num_experts_for_moe,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=self.top_k + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -555,6 +562,15 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                forward_mega_moe,
+                should_use_mega_moe,
+            )
+
+            if should_use_mega_moe(self, hidden_states):
+                return forward_mega_moe(self, hidden_states, forward_batch)
+
         if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None

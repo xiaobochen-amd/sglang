@@ -813,6 +813,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale.dtype == torch.uint8
             assert layer.w2_weight_scale.dtype == torch.uint8
 
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            build_mega_moe_experts_weights(layer)
+            return
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
