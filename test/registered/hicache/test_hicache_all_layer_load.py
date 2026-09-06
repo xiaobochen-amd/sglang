@@ -10,10 +10,15 @@ Run with: pytest test/registered/hicache/test_hicache_all_layer_load.py -v
 Requires: AMD ROCm GPU (gfx90a or later), sgl_kernel with transfer_kv_all_layer_direct_pf_lf.
 """
 
+import sys
 import time
 
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 # Skip the whole module on non-ROCm or if sgl_kernel lacks the all-layer kernel
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
@@ -174,3 +179,7 @@ class TestHiCacheAllLayerLoad:
             f"Expected >=1.5x speedup, got {speedup:.2f}x "
             f"(per-layer={ms_per:.4f}ms, all-layer={ms_all:.4f}ms)"
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

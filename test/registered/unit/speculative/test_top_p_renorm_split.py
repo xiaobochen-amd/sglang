@@ -1,11 +1,18 @@
 """Split-row top-p renorm must match the pivot kernel it replaces on ROCm."""
 
+import sys
+
 import pytest
 import torch
 
 from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
 
-pytestmark = pytest.mark.skipif(not is_hip(), reason="_renorm_top_k_top_p_hip is ROCm-only")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+
+pytestmark = pytest.mark.skipif(
+    not is_hip(), reason="_renorm_top_k_top_p_hip is ROCm-only"
+)
 
 VOCAB = 154880
 
@@ -26,17 +33,13 @@ def test_no_worse_than_the_pivot_kernel(rows, temperature):
     from sglang.srt.speculative.eagle_utils import _top_p_renorm_kernel
 
     torch.manual_seed(rows * 10 + int(temperature * 10))
-    probs = torch.softmax(
-        torch.randn(rows, VOCAB, device="cuda") / temperature, dim=-1
-    )
+    probs = torch.softmax(torch.randn(rows, VOCAB, device="cuda") / temperature, dim=-1)
     top_ps = (0.05 + 0.94 * torch.rand(rows, device="cuda")).float()
 
     ref = _sort_reference(probs, top_ps)
     split = top_p_renorm_split(probs, top_ps)
     shipped = torch.empty_like(probs)
-    _top_p_renorm_kernel[(rows,)](
-        probs, shipped, top_ps, VOCAB, BLOCK=4096, N_ITER=30
-    )
+    _top_p_renorm_kernel[(rows,)](probs, shipped, top_ps, VOCAB, BLOCK=4096, N_ITER=30)
 
     assert (split - ref).abs().max() <= (shipped - ref).abs().max() + 1e-9
     torch.testing.assert_close(
@@ -80,3 +83,7 @@ def test_wrapper_agrees_with_the_pivot_path(rows):
 
     assert torch.equal(on[0], probs[0])
     torch.testing.assert_close(on, off, atol=1e-5, rtol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

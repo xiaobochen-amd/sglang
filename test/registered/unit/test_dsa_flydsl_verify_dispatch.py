@@ -12,6 +12,9 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention import dsa_backend as B
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _fp8(*shape):
