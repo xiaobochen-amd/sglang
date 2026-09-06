@@ -326,7 +326,9 @@ def _fused_rope_cat_and_cache(
     )
 
 
-def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
+def _can_fuse_bmm_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
     Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
@@ -340,7 +342,7 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
         _use_aiter_gfx95
         and attn.w_kc.dtype == torch.float8_e4m3fn
         and attn.rotary_emb is not None
-        and attn._skip_rope_for_dsa_tilelang_fused()
+        and attn._skip_rope_for_dsa_tilelang_fused(forward_batch)
         and attn.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         and not attn.use_deep_gemm_bmm
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
@@ -560,7 +562,7 @@ class DeepseekMLARocmForwardMixin:
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
+            _can_fuse_bmm_rope_cat_and_cache(self, forward_batch)
         )
 
         if q_replicate_active:
@@ -626,7 +628,7 @@ class DeepseekMLARocmForwardMixin:
         if (
             self.rotary_emb is not None
             and (not fuse_rope_for_trtllm_mla)
-            and (not self._skip_rope_for_dsa_tilelang_fused())
+            and (not self._skip_rope_for_dsa_tilelang_fused(forward_batch))
             and (not self._skip_rope_for_aiter_fused_mla())
             and (
                 not _use_aiter
@@ -718,7 +720,10 @@ class DeepseekMLARocmForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused(forward_batch)
+                and self.rotary_emb is not None
+            ):
                 if q_nope_unabsorbed is not None:
                     # prepare left the absorb to us: one kernel for the BMM,
                     # the RoPE and the KV write instead of two launches that
@@ -954,17 +959,33 @@ class DeepseekMLARocmForwardMixin:
         else:
             return output, topk_indices
 
-    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_dsa_tilelang_fused(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
+        if not (
+            _use_aiter_gfx95 and self.current_attention_backend in ("dsa", "nsa")
+        ):
+            return False
+        backends = (
+            get_exec().kernel.dsa_decode_backend,
+            get_exec().kernel.dsa_prefill_backend,
+        )
+        if "tilelang" in backends:
+            return True
+        if "flydsl" not in backends:
+            return False
+        # The fused rope+cat+cache kernel is shaped for decode -- few tokens,
+        # every head. A prefill chunk is the opposite shape, and there it loses
+        # to a plain rope: +1.9% TTFT at production's 97.6% prefix hit, +8.3%
+        # on a cold 102k prompt. Take it only on the shapes it was measured on.
+        mode = forward_batch.forward_mode
         return (
-            _use_aiter_gfx95
-            and self.current_attention_backend in ("dsa", "nsa")
-            and (
-                get_exec().kernel.dsa_decode_backend in ("tilelang", "flydsl")
-                or get_exec().kernel.dsa_prefill_backend in ("tilelang", "flydsl")
-            )
+            mode.is_decode_or_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
         )
 
     def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
