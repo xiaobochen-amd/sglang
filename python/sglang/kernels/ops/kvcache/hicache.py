@@ -20,7 +20,8 @@ _is_hip = is_hip_runtime()
 # ROCm needs a wider grid to saturate mapped-host transfers; CUDA keeps the legacy quota.
 DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
 
-# Mirrors device::kWarpThreads in sgl_kernel/utils.cuh.
+# Mirrors device::kWarpThreads in sgl_kernel/utils.cuh, which kvcacheio/hicache.cuh
+# static_asserts so the two cannot drift apart.
 WARP_THREADS = 32
 
 # Copy-round widths, widest first. The narrow rounds admit element sizes 128
