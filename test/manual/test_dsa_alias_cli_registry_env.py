@@ -37,6 +37,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
     def test_dsa_choices_is_canonical(self):
         self.assertIn("fa3", self.DSA_CHOICES)
         self.assertIn("tilelang", self.DSA_CHOICES)
+        self.assertIn("triton", self.DSA_CHOICES)
         self.assertIn("flashinfer_sparse_mla", self.DSA_CHOICES)
 
     def test_nsa_choices_is_alias(self):
@@ -79,6 +80,10 @@ class TestCLICanonicalFlags(unittest.TestCase):
     def test_dsa_prefill_backend_canonical(self):
         args = self._parse(["--dsa-prefill-backend", "fa3"])
         self.assertEqual(args.dsa_prefill_backend, "fa3")
+
+    def test_dsa_prefill_backend_triton(self):
+        args = self._parse(["--dsa-prefill-backend", "triton"])
+        self.assertEqual(args.dsa_prefill_backend, "triton")
 
     def test_dsa_decode_backend_canonical(self):
         args = self._parse(["--dsa-decode-backend", "tilelang"])

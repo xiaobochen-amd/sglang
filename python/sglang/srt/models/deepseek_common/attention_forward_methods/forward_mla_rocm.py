@@ -973,7 +973,7 @@ class DeepseekMLARocmForwardMixin:
             get_exec().kernel.dsa_decode_backend,
             get_exec().kernel.dsa_prefill_backend,
         )
-        if "tilelang" in backends:
+        if "tilelang" in backends or "triton" in backends:
             return True
         if "flydsl" not in backends:
             return False
