@@ -10,6 +10,10 @@ producing plausible logits.
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 E, TOPK_ROUTED, SHARED, SCALE = 256, 8, 1, 2.5
@@ -79,8 +83,8 @@ def test_shared_expert_appears_exactly_once(monkeypatch, jit):
 
     assert ids.shape[-1] == TOPK_ROUTED + SHARED
     shared = (ids >= E).sum(-1)
-    assert torch.equal(shared, torch.full_like(shared, SHARED)), (
-        f"shared expert appears {shared.tolist()} times a row, expected {SHARED}"
-    )
+    assert torch.equal(
+        shared, torch.full_like(shared, SHARED)
+    ), f"shared expert appears {shared.tolist()} times a row, expected {SHARED}"
     routed = ids[ids < E].view(48, TOPK_ROUTED)
     assert (routed[:, 1:] != routed[:, :-1]).all(), "a routed expert repeats"

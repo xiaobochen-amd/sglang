@@ -4,6 +4,9 @@ from unittest import mock
 
 from sglang.srt import server_args as sa
 from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 VAR = "GPU_PINNED_MIN_XFER_SIZE"
 

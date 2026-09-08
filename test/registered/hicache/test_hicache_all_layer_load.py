@@ -15,18 +15,32 @@ import time
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+
 # Skip the whole module on non-ROCm or if sgl_kernel lacks the all-layer kernel
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
 
 def _check_rocm():
-    from importlib.util import find_spec
-
     try:
         from sglang.srt.utils import is_hip
     except ImportError:
         return False
-    return is_hip() and find_spec("sgl_kernel.kvcacheio") is not None
+    if not is_hip():
+        return False
+    # The reason string above promises the all-layer kernel, so check for the
+    # symbol rather than the module that would hold it: sgl_kernel.kvcacheio
+    # imports fine without it, and _run_all_layer then raises ImportError at
+    # call time instead of the module skipping.
+    try:
+        from sgl_kernel.kvcacheio import (  # noqa: F401
+            transfer_kv_all_layer_direct_pf_lf,
+        )
+    except ImportError:
+        return False
+    return True
 
 
 @pytest.mark.skipif(
