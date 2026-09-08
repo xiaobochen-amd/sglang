@@ -9,6 +9,9 @@ import unittest
 from unittest import mock
 
 from sglang.kernels.ops.attention.dsa.hip_gfx950 import fused_decode as fd
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # GLM-5.2: 78 target layers + 1 draft layer, each with its own Indexer.
 NUM_LAYERS = 79
