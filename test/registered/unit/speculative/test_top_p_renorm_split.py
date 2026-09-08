@@ -4,6 +4,9 @@ import pytest
 import torch
 
 from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 pytestmark = pytest.mark.skipif(
     not is_hip(), reason="_renorm_top_k_top_p_hip is ROCm-only"
