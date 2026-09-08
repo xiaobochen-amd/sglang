@@ -620,9 +620,7 @@ class DeepseekMLARocmForwardMixin:
 
                     q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
                 elif is_kv_b_lora_active(self):
-                    q_nope_out = apply_kv_b_lora_q_correction(
-                        self, q_nope, q_nope_out
-                    )
+                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
@@ -965,9 +963,7 @@ class DeepseekMLARocmForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
-        if not (
-            _use_aiter_gfx95 and self.current_attention_backend in ("dsa", "nsa")
-        ):
+        if not (_use_aiter_gfx95 and self.current_attention_backend in ("dsa", "nsa")):
             return False
         backends = (
             get_exec().kernel.dsa_decode_backend,

@@ -49,7 +49,7 @@ class DSATopKBackend(Enum):
     AITER = "aiter"
 
     @classmethod
-    def resolve(cls, name: str, index_topk: int) -> "DSATopKBackend":
+    def resolve(cls, name: str, index_topk: int) -> DSATopKBackend:
         backend = cls(name)
         if backend is not cls.AITER:
             return backend

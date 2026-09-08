@@ -696,7 +696,6 @@ def _top_p_renorm_kernel(
         tl.store(out_ptr + base + idx, tl.where(p >= lo, p / Z, 0.0), mask=m)
 
 
-
 def _renorm_top_k_top_p_hip(
     probs: torch.Tensor,
     top_ks: torch.Tensor,

@@ -79,8 +79,8 @@ def test_shared_expert_appears_exactly_once(monkeypatch, jit):
 
     assert ids.shape[-1] == TOPK_ROUTED + SHARED
     shared = (ids >= E).sum(-1)
-    assert torch.equal(shared, torch.full_like(shared, SHARED)), (
-        f"shared expert appears {shared.tolist()} times a row, expected {SHARED}"
-    )
+    assert torch.equal(
+        shared, torch.full_like(shared, SHARED)
+    ), f"shared expert appears {shared.tolist()} times a row, expected {SHARED}"
     routed = ids[ids < E].view(48, TOPK_ROUTED)
     assert (routed[:, 1:] != routed[:, :-1]).all(), "a routed expert repeats"

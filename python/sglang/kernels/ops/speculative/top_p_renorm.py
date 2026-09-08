@@ -62,8 +62,14 @@ def _hist0(
 
 @triton.jit
 def _hist_lo(
-    probs_ptr, hist_ptr, pre_ptr, vocab, G,
-    SH: tl.constexpr, BLOCK: tl.constexpr, NB: tl.constexpr,
+    probs_ptr,
+    hist_ptr,
+    pre_ptr,
+    vocab,
+    G,
+    SH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NB: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid // G
@@ -90,8 +96,14 @@ def _hist_lo(
 
 @triton.jit
 def _cut0(
-    hist_ptr, tp_ptr, max_ptr, cut_ptr, acc_ptr,
-    NB0: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr,
+    hist_ptr,
+    tp_ptr,
+    max_ptr,
+    cut_ptr,
+    acc_ptr,
+    NB0: tl.constexpr,
+    HB: tl.constexpr,
+    WIN: tl.constexpr,
 ):
     """Walk one row's bins from the top down, stopping where the mass reaches top_p.
 
@@ -140,8 +152,15 @@ def _cut0(
 
 @triton.jit
 def _cut_lo(
-    hist_ptr, tp_ptr, pre_ptr, acc_in_ptr, pre_out_ptr, acc_ptr, z_ptr,
-    LAST: tl.constexpr, NB: tl.constexpr,
+    hist_ptr,
+    tp_ptr,
+    pre_ptr,
+    acc_in_ptr,
+    pre_out_ptr,
+    acc_ptr,
+    z_ptr,
+    LAST: tl.constexpr,
+    NB: tl.constexpr,
 ):
     row = tl.program_id(0)
     tp = tl.load(tp_ptr + row).to(tl.float64)
@@ -163,14 +182,13 @@ def _cut_lo(
         # kept set needs no second pass over the data.
         tl.store(
             z_ptr + row,
-            acc + tl.sum(tl.where(lane == cut, hv, tl.zeros((NB,), tl.float64)), axis=0),
+            acc
+            + tl.sum(tl.where(lane == cut, hv, tl.zeros((NB,), tl.float64)), axis=0),
         )
 
 
 @triton.jit
-def _apply(
-    probs_ptr, out_ptr, tau_ptr, z_ptr, vocab, G, BLOCK: tl.constexpr
-):
+def _apply(probs_ptr, out_ptr, tau_ptr, z_ptr, vocab, G, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     row = pid // G
     tau = tl.load(tau_ptr + row).to(tl.float32, bitcast=True)
@@ -183,9 +201,7 @@ def _apply(
         idx = s + offs
         m = idx < end
         p = tl.load(probs_ptr + row * vocab + idx, mask=m, other=0.0)
-        tl.store(
-            out_ptr + row * vocab + idx, tl.where(p >= tau, p * inv, 0.0), mask=m
-        )
+        tl.store(out_ptr + row * vocab + idx, tl.where(p >= tau, p * inv, 0.0), mask=m)
 
 
 def top_p_renorm_split(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
@@ -209,13 +225,9 @@ def top_p_renorm_split(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tenso
 
     grid = (rows * G,)
     _hist0[grid](probs, h0, mx, vocab, G, BLOCK=2048, NB0=NB0)
-    _cut0[(rows,)](
-        h0, top_ps, mx, p0, a0, NB0=NB0, HB=HB, WIN=WIN
-    )
+    _cut0[(rows,)](h0, top_ps, mx, p0, a0, NB0=NB0, HB=HB, WIN=WIN)
     _hist_lo[grid](probs, h1, p0, vocab, G, SH=8, BLOCK=2048, NB=NB)
-    _cut_lo[(rows,)](
-        h1, top_ps, p0, a0, p1, a1, z, LAST=False, NB=NB
-    )
+    _cut_lo[(rows,)](h1, top_ps, p0, a0, p1, a1, z, LAST=False, NB=NB)
     _hist_lo[grid](probs, h2, p1, vocab, G, SH=0, BLOCK=2048, NB=NB)
     _cut_lo[(rows,)](h2, top_ps, p1, a1, p2, a2, z, LAST=True, NB=NB)
     _apply[grid](probs, out, p2, z, vocab, G, BLOCK=2048)
