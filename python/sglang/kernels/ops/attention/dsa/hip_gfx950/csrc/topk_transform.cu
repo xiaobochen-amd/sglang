@@ -1148,7 +1148,8 @@ static bool prank_resident_ok(const void *fn, int blocks_per_row, int rows) {
 // window staged in LDS).  Very wide production page-table strides can exceed
 // that fixed window even when the live row is short, so those layouts use the
 // numerically identical PTMODE 0 global-gather specialization instead.
-// FUSEREF keeps the refinement in k_scatter's last-arriving block in both cases.
+// FUSEREF keeps the refinement in k_scatter's last-arriving block in both
+// cases.
 void topk_transform(torch::Tensor logits, torch::Tensor row_ends,
                     torch::Tensor page_table, torch::Tensor out,
                     torch::Tensor ghist, torch::Tensor cursor,
@@ -1184,8 +1185,7 @@ void topk_transform(torch::Tensor logits, torch::Tensor row_ends,
   // a static graph property while row_ends is replay-time data, so use PTS as
   // the conservative upper bound.  PTMODE 0 has no page-table-width limit.
   const bool use_pt_window =
-      (PTS + (int64_t)G - 1) / (int64_t)G + 2 <=
-      (int64_t)dsa_topk::PT_WIN;
+      (PTS + (int64_t)G - 1) / (int64_t)G + 2 <= (int64_t)dsa_topk::PT_WIN;
 
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 grid((unsigned)G, (unsigned)R, 1);
