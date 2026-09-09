@@ -91,7 +91,7 @@ del _grp, _mod, _fn
 # DeepSeek DSA / DSV4 kernels migrated in Phase 2.5 (RFC #29630);
 # registered for inventory. Import them from their modules.
 for _mod, _fn in [
-    ("dsa.triton_sparse_mla", "triton_sparse_mla_fwd"),
+    ("dsa.triton_sparse_mla_prefill", "triton_sparse_mla_prefill_fwd"),
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
     ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
