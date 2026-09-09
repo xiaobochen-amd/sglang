@@ -14,6 +14,7 @@
 
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
+import copy
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -81,6 +82,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.utils import enable_glm_nextn_moe_ptpc
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
@@ -1474,6 +1476,12 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
 
+        # The caller keeps this QuarkConfig for the target model and for
+        # lm_head, so the draft-only rewrites below have to land on a private
+        # copy of both the wrapper and the dict its schemes are read from.
+        quant_config = copy.copy(quant_config)
+        quant_config.quant_config = copy.deepcopy(quant_config.quant_config)
+
         layer_prefix = f"model.layers.{config.num_hidden_layers}"
 
         # Quark's per-module scheme selection (e.g. MTP self_attn in PTPC-FP8
@@ -1507,15 +1515,35 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
 
         # Fused routed experts are queried by the coarse module prefix
         # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
-        # match that prefix, so add the coarse prefix when any routed expert in
-        # the MTP layer is excluded. This keeps only that fused MoE module bf16
-        # while allowing the remaining draft modules to use their quant config.
+        # match that prefix, so that module needs its own entry whenever the MTP
+        # routed experts are excluded: either keep it bf16 like the checkpoint,
+        # or point it at the scheme matching the on-load PTPC-FP8 cast.
         if any(".mlp.experts." in name for name in mtp_excluded):
-            names.add("model.decoder.mlp.experts")
+            if enable_glm_nextn_moe_ptpc(quant_config):
+                mtp_layer_quant_config = quant_config.quant_config.setdefault(
+                    "layer_quant_config", {}
+                )
+                mtp_layer_quant_config["model.decoder.mlp.experts"] = {
+                    "weight": {
+                        "dtype": "fp8_e4m3",
+                        "is_dynamic": False,
+                        "qscheme": "per_channel",
+                    },
+                    # Dynamic per_channel activations are QuarkW8A8FP8MoE's
+                    # per-token input path.
+                    "input_tensors": {
+                        "dtype": "fp8_e4m3",
+                        "is_dynamic": True,
+                        "qscheme": "per_channel",
+                    },
+                }
+                logger.info(
+                    "SGLANG_GLM_NEXTN_MOE_PTPC=1: MTP fused MoE "
+                    "(model.decoder.mlp.experts) runs as PTPC-FP8"
+                )
+            else:
+                names.add("model.decoder.mlp.experts")
 
-        import copy
-
-        quant_config = copy.copy(quant_config)
         quant_config.exclude_layers = list(names)
         return quant_config
 

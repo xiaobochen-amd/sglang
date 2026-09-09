@@ -130,6 +130,21 @@ def enable_nextn_moe_bf16_cast_to_fp8(
     )
 
 
+def enable_glm_nextn_moe_ptpc(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Quark + GLM NextN: cast draft fused MoE from BF16 to per-channel FP8.
+
+    Distinct from ``enable_nextn_moe_bf16_cast_to_fp8`` (NVFP4 / DeepGEMM
+    128x128 block FP8).
+    """
+    return (
+        envs.SGLANG_GLM_NEXTN_MOE_PTPC.get()
+        and quant_config is not None
+        and quant_config.get_name() == "quark"
+    )
+
+
 def is_wint4afp8_or_wint4a16_config(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
