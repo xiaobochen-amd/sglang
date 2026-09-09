@@ -1,32 +1,10 @@
-// Fused DUAL bf16 GEMV for the GLM-5.2 DSA indexer front end.
-// Replaces the first two launches of section A with ONE kernel:
-//   Q  [M, 4096] = q_lora [M, 2048] @ w_q_b [4096, 2048]^T     (K = 2048)
-//   KW [M,  160] = x      [M, 6144] @ w_kw  [ 160, 6144]^T     (K = 6144)
-// The two problems are independent (different source, different K), so one
-// grid can carry both: blocks below ``nblk_k`` do the skinny 160-column
-// projection, the rest do the 4096-column one.  Motivation:
-//   * the 160-column GEMV alone launches only 160 workgroups on 256 CUs and
-//     measures 0.39 TB/s -- it is latency-bound, not bandwidth-bound.  Merged
-//     with the 4096-column one its latency hides inside the big kernel.
-//   * 3 -> 2 launches in section A; the in-graph launch floor on this machine
-//     is 1.45 us per ordinary kernel.
-// Decomposition:
-//   A block has THREADS threads, split into ``THREADS/TPC`` *column groups*.
-//   A group owns NCOL output columns and its TPC threads split the K range,
-//   VPT = (K/8)/TPC sixteen-byte vectors each.  X is loaded into registers
-//   ONCE per thread and reused across all NCOL columns, so the steady-state
-//   VMEM stream is pure weight traffic.  The dot product uses
-//   v_dot2c_f32_bf16 (2 bf16 MACs / instruction, fp32 accumulate) which
-//   removes every bf16 -> f32 conversion from the inner loop.
-// Layout contract: X is [M,K] row-major bf16, W is [N,K] row-major bf16
-// (torch F.linear weight), O is [M,N] row-major bf16.  K % (8*TPC) == 0 and
-// all pointers 16-byte aligned.
+// Fused dual bf16 GEMV: Q [M,4096] from K=2048 and KW [M,160] from K=6144 in
+// one grid, since the 160-column half alone leaves the card idle.  The K half
+// is register-blocked v_dot2c; the Q half is MFMA and ignores the ld* args.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
-
-#include <vector>
 
 #ifndef __HIP_PLATFORM_AMD__
 #define __HIP_PLATFORM_AMD__
@@ -58,16 +36,7 @@ __device__ __forceinline__ ushort_t f32_to_bf16_rne(float f) {
   return static_cast<ushort_t>(u >> 16);
 }
 
-typedef unsigned int u32x4_t __attribute__((ext_vector_type(4)));
-
-__device__ __forceinline__ uint4 load_w(const uint4 *p, bool nt) {
-  if (nt) {
-    u32x4_t v =
-        __builtin_nontemporal_load(reinterpret_cast<const u32x4_t *>(p));
-    return make_uint4(v.x, v.y, v.z, v.w);
-  }
-  return *p;
-}
+__device__ __forceinline__ uint4 load_w(const uint4 *p) { return *p; }
 
 // gfx950 exact-Q path.  This is the reduction topology used by the production
 // hipBLASLt MT16x16x512 kernel: four local-split-U accumulators, each owning a
@@ -94,9 +63,9 @@ load_q_mfma_operands(const bf16_t *__restrict__ x, const bf16_t *__restrict__ w,
   }
 }
 
-// ``THREADS`` runs this body as ``THREADS/256`` INDEPENDENT 256-thread column
-// groups inside one workgroup.  Each group keeps its own 4 waves, its own 16
-// columns, its own 64*M-float slice of LDS and its own four-part LSU reduction,
+// ``THREADS`` runs this body as ``THREADS/256`` independent 256-thread column
+// groups inside one workgroup, each with its own waves, columns, LDS slice and
+// reduction.
 template <int M, int THREADS, int PIPE = 0>
 __device__ __forceinline__ void
 gemv_q_mfma_lsu4(const uint4 *__restrict__ Xv, const uint4 *__restrict__ Wv,
@@ -117,52 +86,29 @@ gemv_q_mfma_lsu4(const uint4 *__restrict__ Xv, const uint4 *__restrict__ Wv,
   const int operand_row = lane & 15;
   const int kg = lane >> 4;
   float4_t acc = {};
-  if constexpr (PIPE > 0) {
-    // Shift the next global-load pair ahead of the current dependent MFMA.
-    // The accumulator visits the same 16 K fragments in the same order; only
-    // the operand lifetime changes.  This is therefore bit-exact to LSU4.
-    constexpr int kStages = PIPE + 1;
-    bf16x8_t abuf[kStages];
-    bf16x8_t bbuf[kStages];
+  // Shift the next global-load pair ahead of the current dependent MFMA.
+  // The accumulator visits the same 16 K fragments in the same order; only
+  // the operand lifetime changes.  This is therefore bit-exact to LSU4.
+  constexpr int kStages = PIPE + 1;
+  bf16x8_t abuf[kStages];
+  bf16x8_t bbuf[kStages];
 #pragma unroll
-    for (int preload = 0; preload < kStages - 1; ++preload) {
-      load_q_mfma_operands<M>(x, w, col0, N, K, wave, lane, preload,
-                              abuf[preload], bbuf[preload]);
-    }
+  for (int preload = 0; preload < kStages - 1; ++preload) {
+    load_q_mfma_operands<M>(x, w, col0, N, K, wave, lane, preload,
+                            abuf[preload], bbuf[preload]);
+  }
 #pragma unroll
-    for (int step = 0; step < 16; ++step) {
-      const int cur = step % kStages;
-      const int ahead = step + kStages - 1;
-      if (ahead < 16) {
-        const int next = ahead % kStages;
-        load_q_mfma_operands<M>(x, w, col0, N, K, wave, lane, ahead, abuf[next],
-                                bbuf[next]);
-      }
-      acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(abuf[cur], bbuf[cur], acc,
-                                                    0, 0, 0);
-      asm volatile("" : "+v"(acc));
+  for (int step = 0; step < 16; ++step) {
+    const int cur = step % kStages;
+    const int ahead = step + kStages - 1;
+    if (ahead < 16) {
+      const int next = ahead % kStages;
+      load_q_mfma_operands<M>(x, w, col0, N, K, wave, lane, ahead, abuf[next],
+                              bbuf[next]);
     }
-  } else {
-    const bf16x8_t zero = {};
-    for (int base = 0; base < K; base += 512) {
-#pragma unroll
-      for (int off = 0; off < 128; off += 32) {
-        const int kk = base + wave * 128 + off;
-        bf16x8_t a = zero;
-        bf16x8_t b = zero;
-        if (operand_row < M) {
-          a = *reinterpret_cast<const bf16x8_t *>(x + (long)operand_row * K +
-                                                  kk + kg * 8);
-        }
-        const int wc = col0 + operand_row;
-        if (wc < N) {
-          b = *reinterpret_cast<const bf16x8_t *>(w + (long)wc * K + kk +
-                                                  kg * 8);
-        }
-        acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(a, b, acc, 0, 0, 0);
-        asm volatile("" : "+v"(acc));
-      }
-    }
+    acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(abuf[cur], bbuf[cur], acc, 0,
+                                                  0, 0);
+    asm volatile("" : "+v"(acc));
   }
   const int out_col_local = lane & 15;
   const int out_row0 = (lane >> 4) * 4;
@@ -185,15 +131,13 @@ gemv_q_mfma_lsu4(const uint4 *__restrict__ Xv, const uint4 *__restrict__ Wv,
   }
 }
 
-// ---------------------------------------------------------------------------
 // one column-group body.  smem is [THREADS/64][NCOL][M] floats.
-template <int M, int THREADS, int TPC, int NCOL, int VPT, bool NT>
+template <int M, int THREADS, int TPC, int NCOL, int VPT>
 __device__ __forceinline__ void
 gemv_group(const uint4 *__restrict__ Xv, long ldxv,
            const uint4 *__restrict__ Wv, long ldwv, ushort_t *__restrict__ O,
            long ldo, int blk_col0, int N, float *smem) {
   constexpr int kGroups = THREADS / TPC;
-  constexpr int kWaves = THREADS / 64;
   constexpr int kWPG = TPC / 64; // waves per group (>=1 by construction)
 
   const int tid = threadIdx.x;
@@ -202,7 +146,6 @@ gemv_group(const uint4 *__restrict__ Xv, long ldxv,
   const int cbase = blk_col0 + gid * NCOL;
 
   // ---- X into registers, packed as 4 x bf16x2 per 16-byte vector ----------
-  constexpr int kXVec = M * VPT * TPC; // uint4 of X the whole block needs
   unsigned int xr[M][VPT][4];
 #pragma unroll
   for (int m = 0; m < M; ++m) {
@@ -226,7 +169,7 @@ gemv_group(const uint4 *__restrict__ Xv, long ldxv,
     const uint4 *wp = Wv + (long)(col < N ? col : 0) * ldwv + lane;
 #pragma unroll
     for (int p = 0; p < VPT; ++p) {
-      wr[c][p] = load_w(wp + p * TPC, NT);
+      wr[c][p] = load_w(wp + p * TPC);
     }
   }
 
@@ -284,18 +227,15 @@ gemv_group(const uint4 *__restrict__ Xv, long ldxv,
       O[(long)m * ldo + col] = v;
     }
   }
-  (void)kWaves;
 }
 
 template <int M, int THREADS, int TPCK, int NCOLK, int VPTK, int TPCQ,
-          int NCOLQ, int VPTQ, bool NT, int ORDER, bool QMFMA = false,
-          int QPIPE = 0>
+          int NCOLQ, int VPTQ, int QPIPE = 0>
 __global__ __launch_bounds__(THREADS) void dual_gemv_kernel(
     const uint4 *__restrict__ Xq, long ldxq, const uint4 *__restrict__ Wq,
     long ldwq, ushort_t *__restrict__ Oq, long ldoq, int Nq,
     const uint4 *__restrict__ Xk, long ldxk, const uint4 *__restrict__ Wk,
-    long ldwk, ushort_t *__restrict__ Ok, long ldok, int Nk, int nblk_k,
-    int stride_k) {
+    long ldwk, ushort_t *__restrict__ Ok, long ldok, int Nk, int nblk_k) {
   constexpr int kColsPerBlkK = (THREADS / TPCK) * NCOLK;
   constexpr int kColsPerBlkQ = (THREADS / TPCQ) * NCOLQ;
   constexpr int kSmemK = (THREADS / 64) * NCOLK * M;
@@ -303,39 +243,18 @@ __global__ __launch_bounds__(THREADS) void dual_gemv_kernel(
   __shared__ float smem[kSmemK > kSmemQ ? kSmemK : kSmemQ];
 
   const int bid = blockIdx.x;
-  bool do_k;
-  int b;
-  if (ORDER == 0) {
-    do_k = bid < nblk_k;
-    b = do_k ? bid : bid - nblk_k;
-  } else if (ORDER == 1) {
-    const int first_k = gridDim.x - nblk_k;
-    do_k = bid >= first_k;
-    b = do_k ? bid - first_k : bid;
-  } else {
-    const int q = bid / stride_k;
-    do_k = (bid - q * stride_k) == 0 && q < nblk_k;
-    if (do_k) {
-      b = q;
-    } else {
-      int before = (bid + stride_k - 1) / stride_k;
-      if (before > nblk_k)
-        before = nblk_k;
-      b = bid - before;
-    }
-  }
+  // The K blocks sit at the END of the grid, so the Q blocks -- which carry the
+  // longer dependent chain -- are dispatched first.
+  const int first_k = gridDim.x - nblk_k;
+  const bool do_k = bid >= first_k;
+  const int b = do_k ? bid - first_k : bid;
 
   if (do_k) {
-    gemv_group<M, THREADS, TPCK, NCOLK, VPTK, NT>(Xk, ldxk, Wk, ldwk, Ok, ldok,
-                                                  b * kColsPerBlkK, Nk, smem);
+    gemv_group<M, THREADS, TPCK, NCOLK, VPTK>(Xk, ldxk, Wk, ldwk, Ok, ldok,
+                                              b * kColsPerBlkK, Nk, smem);
   } else {
-    if constexpr (QMFMA) {
-      gemv_q_mfma_lsu4<M, THREADS, QPIPE>(Xq, Wq, Oq, ldoq, b * kColsPerBlkQ,
-                                          Nq, VPTQ * TPCQ * 8, smem);
-    } else {
-      gemv_group<M, THREADS, TPCQ, NCOLQ, VPTQ, NT>(
-          Xq, ldxq, Wq, ldwq, Oq, ldoq, b * kColsPerBlkQ, Nq, smem);
-    }
+    gemv_q_mfma_lsu4<M, THREADS, QPIPE>(Xq, Wq, Oq, ldoq, b * kColsPerBlkQ, Nq,
+                                        VPTQ * TPCQ * 8, smem);
   }
 }
 
@@ -359,8 +278,8 @@ struct Args {
   hipStream_t stream;
 };
 
-template <int M, int THREADS, int TPCK, int NCOLK, int TPCQ, int NCOLQ, bool NT,
-          int ORDER, bool QMFMA = false, int QPIPE = 0>
+template <int M, int THREADS, int TPCK, int NCOLK, int TPCQ, int NCOLQ,
+          int QPIPE = 0>
 void launch(const Args &a) {
   constexpr int kColsK = (THREADS / TPCK) * NCOLK;
   constexpr int kColsQ = (THREADS / TPCQ) * NCOLQ;
@@ -370,60 +289,35 @@ void launch(const Args &a) {
   TORCH_CHECK(VPTQ * TPCQ * 8 == a.Kq, "Kq not divisible by 8*TPCQ");
   const int nblk_k = (a.Nk + kColsK - 1) / kColsK;
   const int nblk_q = (a.Nq + kColsQ - 1) / kColsQ;
-  const int stride_k = (nblk_k + nblk_q) / (nblk_k > 0 ? nblk_k : 1);
 
 #define DG_CALL(VK, VQ)                                                        \
   do {                                                                         \
-    dual_gemv_kernel<M, THREADS, TPCK, NCOLK, VK, TPCQ, NCOLQ, VQ, NT, ORDER,  \
-                     QMFMA, QPIPE>                                             \
+    dual_gemv_kernel<M, THREADS, TPCK, NCOLK, VK, TPCQ, NCOLQ, VQ, QPIPE>      \
         <<<dim3(nblk_k + nblk_q), dim3(THREADS), 0, a.stream>>>(               \
             a.Xq, a.ldxq, a.Wq, a.ldwq, a.Oq, a.ldoq, a.Nq, a.Xk, a.ldxk,      \
-            a.Wk, a.ldwk, a.Ok, a.ldok, a.Nk, nblk_k, stride_k);               \
+            a.Wk, a.ldwk, a.Ok, a.ldok, a.Nk, nblk_k);                         \
   } while (0)
 
-  // Kq = 2048 -> 256 vectors; Kk = 6144 -> 768 vectors.  Only the (VPTK,VPTQ)
-  // pairs that those two shapes can produce for TPC in {64,128,256} are
-  // instantiated.
-  if (VPTK == 3 && VPTQ == 1) {
-    DG_CALL(3, 1);
-  } else if (VPTK == 3 && VPTQ == 2) {
-    DG_CALL(3, 2);
-  } else if (VPTK == 3 && VPTQ == 4) {
-    DG_CALL(3, 4);
-  } else if (VPTK == 6 && VPTQ == 1) {
-    DG_CALL(6, 1);
-  } else if (VPTK == 6 && VPTQ == 2) {
-    DG_CALL(6, 2);
-  } else if (VPTK == 6 && VPTQ == 4) {
-    DG_CALL(6, 4);
-  } else if (VPTK == 12 && VPTQ == 4) {
-    DG_CALL(12, 4);
-  } else {
-    TORCH_CHECK(false, "unsupported (VPTK,VPTQ)=(", VPTK, ",", VPTQ, ")");
-  }
+  // The shipped configuration is the only one this file builds; the template
+  // arguments record it rather than select it.
+  TORCH_CHECK(VPTK == 3 && VPTQ == 1,
+              "dual_gemv is built for Kk=6144, Kq=2048; got Kk=", a.Kk,
+              " Kq=", a.Kq);
+  DG_CALL(3, 1);
 #undef DG_CALL
 }
 
-// ---------------------------------------------------------------------------
-// config table.  cfg id -> (THREADS, TPCK, NCOLK, TPCQ, NCOLQ, NT, KFIRST)
-// ---------------------------------------------------------------------------
-template <int M> void dispatch_cfg(int cfg, const Args &a) {
-  switch (cfg) {
-  // The accepted configuration, kept alone.  The 67-cfg sweep that chose it is
-  // in the campaign log; each retired case cost 8 more template expansions.
-  //             THR TPCK NK TPCQ NQ  NT     ORDER MFMA PIPE
-  case 61:
-    launch<M, 256, 256, 2, 256, 16, false, 1, true, 2>(a);
-    break;
-  default:
-    TORCH_CHECK(false, "unknown dual_gemv cfg ", cfg);
-  }
+// The accepted configuration.  Its parameters are template arguments, not a
+// selector: retuning means editing this line.
+//                       THR TPCK NK TPCQ NQ  PIPE
+template <int M> void dispatch(const Args &a) {
+  launch<M, 256, 256, 2, 256, 16, 2>(a);
 }
 
 } // namespace
 
 void dual_gemv_bf16(at::Tensor Xq, at::Tensor Wq, at::Tensor Oq, at::Tensor Xk,
-                    at::Tensor Wk, at::Tensor Ok, int64_t cfg) {
+                    at::Tensor Wk, at::Tensor Ok) {
   for (auto *t : {&Xq, &Wq, &Oq, &Xk, &Wk, &Ok})
     TORCH_CHECK(t->scalar_type() == at::kBFloat16, "all tensors must be bf16");
   TORCH_CHECK(Xq.dim() == 2 && Wq.dim() == 2 && Oq.dim() == 2, "2-D");
@@ -454,6 +348,12 @@ void dual_gemv_bf16(at::Tensor Xq, at::Tensor Wq, at::Tensor Oq, at::Tensor Xk,
 
   TORCH_CHECK(Wq.size(1) == a.Kq && Wk.size(1) == a.Kk, "K mismatch");
   TORCH_CHECK(Oq.size(1) == a.Nq && Ok.size(1) == a.Nk, "N mismatch");
+  // The Q half addresses x + operand_row * K, so a padded tensor would read the
+  // wrong rows with no other symptom.  Hence the stride check, not ldxq.
+  TORCH_CHECK(
+      Xq.stride(0) == a.Kq && Wq.stride(0) == a.Kq,
+      "the Q path reads packed rows: Xq/Wq stride(0) must equal Kq, got ",
+      Xq.stride(0), "/", Wq.stride(0), " for Kq=", a.Kq);
   TORCH_CHECK(Xq.stride(0) % 8 == 0 && Wq.stride(0) % 8 == 0, "align Q");
   TORCH_CHECK(Xk.stride(0) % 8 == 0 && Wk.stride(0) % 8 == 0, "align K");
   TORCH_CHECK(Xq.stride(1) == 1 && Wq.stride(1) == 1 && Oq.stride(1) == 1,
@@ -463,28 +363,28 @@ void dual_gemv_bf16(at::Tensor Xq, at::Tensor Wq, at::Tensor Oq, at::Tensor Xk,
 
   switch (M) {
   case 1:
-    dispatch_cfg<1>(static_cast<int>(cfg), a);
+    dispatch<1>(a);
     break;
   case 2:
-    dispatch_cfg<2>(static_cast<int>(cfg), a);
+    dispatch<2>(a);
     break;
   case 3:
-    dispatch_cfg<3>(static_cast<int>(cfg), a);
+    dispatch<3>(a);
     break;
   case 4:
-    dispatch_cfg<4>(static_cast<int>(cfg), a);
+    dispatch<4>(a);
     break;
   case 5:
-    dispatch_cfg<5>(static_cast<int>(cfg), a);
+    dispatch<5>(a);
     break;
   case 6:
-    dispatch_cfg<6>(static_cast<int>(cfg), a);
+    dispatch<6>(a);
     break;
   case 7:
-    dispatch_cfg<7>(static_cast<int>(cfg), a);
+    dispatch<7>(a);
     break;
   case 8:
-    dispatch_cfg<8>(static_cast<int>(cfg), a);
+    dispatch<8>(a);
     break;
   default:
     TORCH_CHECK(false, "unreachable");
@@ -496,6 +396,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dual_gemv_bf16", &dual_gemv_bf16,
         "fused dual bf16 GEMV: Oq = Xq @ Wq^T and Ok = Xk @ Wk^T in one launch",
         pybind11::arg("Xq"), pybind11::arg("Wq"), pybind11::arg("Oq"),
-        pybind11::arg("Xk"), pybind11::arg("Wk"), pybind11::arg("Ok"),
-        pybind11::arg("cfg") = 0);
+        pybind11::arg("Xk"), pybind11::arg("Wk"), pybind11::arg("Ok"));
 }

@@ -1,14 +1,18 @@
-// -----------------------------------------------------------------------------
 // GLM-5.2 DSA indexer, the logits kernel: paged MQA FP8 logits.  Raw HIP for
 // gfx950.
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <torch/extension.h>
 
 #include <cstdint>
 
 typedef __attribute__((__vector_size__(8 * sizeof(int)))) int i32x8;
 typedef __attribute__((__vector_size__(4 * sizeof(int)))) int i32x4;
 typedef __attribute__((__vector_size__(4 * sizeof(float)))) float f32x4;
+
+namespace dsa_logits {
 
 #define PAGE_TOK 64
 #define HD 128
@@ -26,15 +30,6 @@ __device__ __forceinline__ f32x4 mfma128(i32x8 a, i32x8 b, f32x4 c) {
                                                           0, 127);
 }
 
-// relu in exactly one v_max_f32.  fmaxf() lowers to TWO v_max_f32 (LLVM
-// canonicalises the operand for NaN semantics); the MFMA output here can never
-// be NaN, so the canonicalisation is pure waste -- 32 instructions per page.
-__device__ __forceinline__ float relu0(float x) {
-  float r;
-  asm("v_max_f32 %0, %1, 0" : "=v"(r) : "v"(x));
-  return r;
-}
-
 // wave64 lane exchanges on the VALU instead of through LDS:
 //   xor32 <- v_permlane64_b32 (lane l reads lane l^32)
 //   xor16 <- v_permlanex16_b32 with identity selectors (lane l reads lane l^16)
@@ -50,61 +45,18 @@ __device__ __forceinline__ float xor16(float x, int lane) {
   return __builtin_bit_cast(float, (lane & 16) ? r[0] : r[1]);
 }
 
-template <int NT> __device__ __forceinline__ i32x4 ldv(const void *p) {
-  return NT ? __builtin_nontemporal_load((const i32x4 *)p) : *(const i32x4 *)p;
-}
-template <int NT> __device__ __forceinline__ float lds1(const float *p) {
-  return NT ? __builtin_nontemporal_load(p) : *p;
-}
-template <int NT> __device__ __forceinline__ void stf(float v, float *p) {
-  if (NT)
-    __builtin_nontemporal_store(v, p);
-  else
-    *p = v;
-}
-
-// -----------------------------------------------------------------------------
-// The top-k stage's histogram, built here.
-// This kernel's issue slots are idle waiting on KV loads, so binning a logit it
-// already holds in a register is close to free, and it deletes a whole 1.49 MB
-// read pass plus a launch from the top-k stage.
-// THREE THINGS THAT MUST BE EXACTLY RIGHT:
-//  1. bin on the SAME key the top-k stage's threshold derivation uses,
-//     order_key16(v) >> (16-HB), so that derivation stays bit-identical;
-//  2. positions >= seqlen must NOT be binned.  `out` is [B, 62016] and this
-//     kernel writes -INFINITY past the end of the row; order_key16(-inf) >> 4
-//     is bin 63 and would inflate `above` and under-fill the output with -1;
-//  3. rows with seqlen <= topk must not be binned AT ALL.  The stage that
-//     re-zeroes the histogram early-returns on them, so binning such a row
-//     would leave the histogram permanently dirty for every later call.  Those
-//     rows are written in full by k_scatter.
-// -----------------------------------------------------------------------------
-__device__ __forceinline__ uint32_t order_key16(float x) {
-  __half h = __float2half_rn(x);
-  unsigned short bits = __half_as_ushort(h);
-  unsigned short key = (bits & 0x8000) ? (unsigned short)(~bits)
-                                       : (unsigned short)(bits | 0x8000);
-  return (uint32_t)key;
-}
-
-// -----------------------------------------------------------------------------
-// Phase K / C1: CO==1 additionally maintains a 64-bin COARSE summary of the
-// same histogram, so that the top-k stage's 192 k_scatter blocks can derive the
-// threshold
+// The top-k stage's histogram, built here while this kernel waits on KV loads.
+// Its three invariants are enforced rather than described: the shared key
+// (order_bin_fast), the npages clamp, and do_hist with its topk TORCH_CHECK.
 #define LG_CBITS 6
 #define LG_CBINS (1 << LG_CBITS)
 
-#define CAND_GBMAX 64
-#define CAND_NBUCKET 256
-#define PAGE_BITS 6
-
-// =============================================================================
 // Fused paged-MQA FP8 logits + in-loop fine histogram + coarse summary.  The
 // histogram is what lets the top-k stage skip a separate scoring pass.
 
 // order_key16(x) >> LOWB in 4 VALU ops after the cvt, with no branch and no
-// v_cndmask.  BIT-IDENTICAL to (order_key16(x) >> LOWB) for every finite x and
-// for +/-0:  writing m = (int)float_bits(x) >> 31 (all-ones iff x is negative,
+// v_cndmask.  Bit-identical to topk_transform.cu's order_key16(x) >> LOWB for
+// every finite x and for +/-0.
 template <int LOWB>
 __device__ __forceinline__ uint32_t order_bin_fast(float x) {
   const uint32_t h = (uint32_t)__half_as_ushort(__float2half_rn(x));
@@ -112,7 +64,6 @@ __device__ __forceinline__ uint32_t order_bin_fast(float x) {
   return (h >> LOWB) ^ (0x8000u >> LOWB) ^ (m & (0x7fffu >> LOWB));
 }
 
-// -----------------------------------------------------------------------------
 template <int WARPS, int HB>
 __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
     const uint8_t *__restrict__ q, const uint8_t *__restrict__ kv,
@@ -137,7 +88,11 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
   const int lane = threadIdx.x & 63;
   const int warp = threadIdx.x >> 6;
   const int seqlen = seqlens[row];
-  const int npages = (seqlen + PAGE_TOK - 1) / PAGE_TOK;
+  // seqlen is device data, so no TORCH_CHECK can bound it.  Without the clamp
+  // an oversized row walks into the NEXT row's page table -- valid memory,
+  // plausible page ids, confidently wrong logits.
+  const int npages_raw = (seqlen + PAGE_TOK - 1) / PAGE_TOK;
+  const int npages = npages_raw < max_pages ? npages_raw : max_pages;
   const int g = lane >> 4, c = lane & 15;
   // Nothing to rank when the row is shorter than topk: everything is selected,
   // so the histogram, its two barriers and the epilogue all compile out.
@@ -216,7 +171,7 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
 
     // ---- coarse summary, mapped over the GLOBAL bin index ----
     // Thread tx owns global bins [tx*PERT, tx*PERT+PERT), which lies inside
-    // coarse bin (tx*PERT)>>CSH.  No barrier of its own, and emitted BEFORE
+    // coarse bin (tx*PERT)>>CSH.  Needs no barrier of its own.
     const int g0 = (int)threadIdx.x * PERT;
     unsigned int acc = 0u;
 #pragma unroll
@@ -238,26 +193,78 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
   }
 }
 
-// -----------------------------------------------------------------------------
-extern "C" {
+// One kernel ships: logits_hist_m<8, 12>.  WARPS and HB are template arguments,
+// so there is nothing to select and nothing to validate at runtime.
+static void logits_hist(at::Tensor q, at::Tensor kv, at::Tensor weights,
+                        at::Tensor seqlens, at::Tensor page_table,
+                        at::Tensor out, at::Tensor ghist,
+                        int64_t blocks_per_row, int64_t topk) {
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+  TORCH_CHECK(weights.is_contiguous() && weights.scalar_type() == at::kFloat,
+              "weights must be contiguous fp32");
+  TORCH_CHECK(out.scalar_type() == at::kFloat && out.stride(1) == 1,
+              "logits out must be fp32 with unit row stride");
+  TORCH_CHECK(kv.is_contiguous(), "kv cache must be contiguous");
+  TORCH_CHECK(page_table.is_contiguous() &&
+                  page_table.scalar_type() == at::kInt,
+              "page_table_64 must be contiguous int32");
+  TORCH_CHECK(
+      seqlens.scalar_type() == at::kInt && seqlens.is_contiguous() &&
+          seqlens.numel() >= q.size(0),
+      "seqlens must be a contiguous int32 tensor with one entry per row");
+  // A captured table is as wide as the graph while the row is as long as
+  // seqlens says, so it may exceed `out`; what must hold is that `out` covers
+  // whole pages.
+  TORCH_CHECK(out.size(1) % PAGE_TOK == 0,
+              "out row must be a whole number of pages, got ", out.size(1));
+  // PAGE_TOK and TOK_STRIDE are compiled in; a cache laid out differently is
+  // read as garbage rather than refused.
+  TORCH_CHECK(kv.dim() == 2 && kv.size(1) == PAGE_TOK * TOK_STRIDE,
+              "kv cache rows must be PAGE_TOK * TOK_STRIDE = ",
+              PAGE_TOK * TOK_STRIDE, ", got ", kv.size(1));
+  TORCH_CHECK(ghist.scalar_type() == at::kInt, "ghist must be int32");
+  // topk_transform.cu hardcodes TOPK, and the two must agree on which rows
+  // get binned: a row binned here but skipped there is never zeroed, and the
+  // histogram stays dirty for the life of the process.
+  TORCH_CHECK(topk == 2048, "the paired top-k kernel is built for k=2048, got ",
+              topk);
+  // The launch below is logits_hist_m<8, HOST_HB>, so the row stride the kernel
+  // writes is fixed here too.  topk_transform.cu checks the same width from its
+  // side; without this one a mismatch overruns into the next row's counters.
+  constexpr int HOST_HB = 12;
+  constexpr int64_t HOST_GHS = (1 << HOST_HB) + LG_CBINS;
+  TORCH_CHECK(ghist.numel() == q.size(0) * HOST_GHS, "ghist must be [rows, ",
+              HOST_GHS, "], got ", ghist.numel(), " elements for ", q.size(0),
+              " rows");
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == 32 && q.size(2) == HD,
+              "q must be [rows, 32, 128], got ", q.sizes());
+  TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fnuz ||
+                  q.scalar_type() == at::kFloat8_e4m3fn,
+              "q must be fp8 e4m3; it is read as raw bytes");
+  TORCH_CHECK(kv.scalar_type() == q.scalar_type(),
+              "kv cache must have the same fp8 dtype as q");
+  TORCH_CHECK(weights.dim() == 2 && weights.size(0) == q.size(0) &&
+                  weights.size(1) == q.size(1),
+              "weights must be [rows, heads]");
+  TORCH_CHECK(q.size(0) == out.size(0) && q.size(0) == page_table.size(0),
+              "rows must match across q / logits / page_table");
 
-// One kernel ships: logits_hist_m<8, 12, ...>, the accepted hip_histM_w8b48.
-// The Phase M search space -- 7 kernel families, 80 variants, the histogram-
-// narrowing, flush-mode and warp-count crosses -- is in the campaign log.
-int launch_logits(const void *q, const void *kv, const void *wgt,
-                  const void *seqlens, const void *ptable, void *out, int batch,
-                  int heads, int max_pages, int out_stride, int blocks_per_row,
-                  int warps, void *stream, void *ghist, int hist_bits,
-                  int topk) {
-  if (hist_bits != 12)
-    return -3;
-  if (warps != 8)
-    return -6;
-  hipLaunchKernelGGL((logits_hist_m<8, 12>), dim3(blocks_per_row, batch),
-                     dim3(8 * 64), 0, (hipStream_t)stream, (const uint8_t *)q,
-                     (const uint8_t *)kv, (const float *)wgt,
-                     (const int *)seqlens, (const int *)ptable, (float *)out,
-                     (unsigned int *)ghist, heads, max_pages, out_stride, topk);
-  return (int)hipGetLastError();
+  hipLaunchKernelGGL(
+      (logits_hist_m<8, HOST_HB>), dim3((int)blocks_per_row, (int)q.size(0)),
+      dim3(8 * 64), 0, at::cuda::getCurrentCUDAStream().stream(),
+      (const uint8_t *)q.data_ptr(), (const uint8_t *)kv.data_ptr(),
+      weights.data_ptr<float>(), seqlens.data_ptr<int>(),
+      page_table.data_ptr<int>(), out.data_ptr<float>(),
+      (unsigned int *)ghist.data_ptr(), (int)q.size(1), (int)page_table.size(1),
+      (int)out.stride(0), (int)topk);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+} // namespace dsa_logits
+
+using dsa_logits::logits_hist;
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("logits_hist", &logits_hist,
+        "paged MQA fp8 logits + fine/coarse histogram (gfx950)");
 }

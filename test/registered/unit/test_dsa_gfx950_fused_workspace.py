@@ -1,9 +1,6 @@
-"""Bookkeeping for the gfx950 fused DSA indexer workspace.
-
-The buffers are pure scratch, so one workspace per (device, fp8 dtype) serves
-every layer. These tests pin that down without a GPU by standing a counting
-double in for _Workspace: only ensure_workspace's bookkeeping is under test.
-"""
+"""Workspace bookkeeping: the buffers are scratch, so one per (device, fp8
+dtype) serves every layer.  A counting double stands in for _Workspace, so
+only ensure_workspace's bookkeeping is under test."""
 
 import unittest
 from unittest import mock
@@ -11,10 +8,11 @@ from unittest import mock
 from sglang.kernels.ops.attention.dsa.hip_gfx950 import fused_decode as fd
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
 # GLM-5.2: 78 target layers + 1 draft layer, each with its own Indexer.
 NUM_LAYERS = 79
+
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class CountingWorkspace:
@@ -91,19 +89,10 @@ class TestFusedIndexerWorkspace(unittest.TestCase):
         self.assertEqual(CountingWorkspace.made, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestWorkspaceWidthRefusalIsLoud(unittest.TestCase):
-    """A workspace narrower than the request must refuse *and* say so.
-
-    Regression test for a silent disable: capping the preallocated width below
-    the model context made ensure_workspace return False on every decode call,
-    so the fused path never ran for an entire 1800 s benchmark while the startup
-    log still reported "gfx950 fused DSA indexer enabled". The A/B that run
-    produced compared two identical arms.
-    """
+    """A workspace narrower than the request must refuse and say so once: the
+    refusal disables the feature for the rest of the run while every other log
+    line still reports it as enabled."""
 
     def setUp(self):
         fd._WORKSPACES.clear()
@@ -141,3 +130,7 @@ class TestWorkspaceWidthRefusalIsLoud(unittest.TestCase):
             state.ensure_workspace(device=0, max_cols=1048576, fp8_dtype="fp8")
         )
         self.assertFalse(fd._WARNED_TOO_NARROW)
+
+
+if __name__ == "__main__":
+    unittest.main()

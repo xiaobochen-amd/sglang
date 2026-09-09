@@ -1,41 +1,12 @@
-"""Numerical checks for the gfx950 fused DSA-indexer kernels.
-
-Covered here, each against an implementation that was already in the tree:
-
-  node 1  dual_gemv_bf16   -> torch.mm on the same operands
-  node 4  topk_transform   -> aiter's dsa_topk_transform, selecting from the
-                              same logits, compared as exact sets of physical
-                              slots
-
-NOT covered, stated plainly rather than left to be assumed:
-
-  node 2  qk_rope_hadamard_quant_and_cache
-  node 3  logits_hist
-
-Both read or write the FP8 index-K cache in aiter's preshuffled page layout,
-where each 64-token page interleaves the 128 K bytes and the 4 ue8m0 scale
-bytes rather than storing them as [128 K][4 scale] per token. A test cannot
-synthesise that content: random bytes give scale exponents spanning 2**+-127
-and fp8 NaN patterns, and a comparison then measures denormal handling instead
-of the dot product (measured: 1.2 dB SNR against aiter, with individual entries
-agreeing to 7 digits and others differing in sign -- the signature of garbage
-inputs, not of a wrong kernel). Producing a valid cache needs either a torch
-model of the layout or the in-tree ``fused_store_index_k_cache``, whose JIT does
-not build in the ROCm image. Until one of those exists, treat nodes 2 and 3 as
-untested; node 4's inputs below are therefore synthetic on purpose, which is
-sound because both sides of that comparison read the same logits.
-
-Requires a gfx950 device and a successful build of the extension modules;
-skipped otherwise.
-"""
+"""Numerical checks for nodes 1 and 4 against torch.mm and aiter respectively.
+Nodes 2 and 3 are NOT covered: they read aiter's preshuffled FP8 cache, which
+a test cannot synthesise (random bytes measure denormal handling, not maths)."""
 
 import unittest
 
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
-
-register_amd_ci(est_time=200, stage="stage-b", runner_config="1-gpu-large-amd")
 
 HEAD_DIM = 128
 N_HEADS = 32
@@ -75,6 +46,9 @@ def _snr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     return float(10 * torch.log10(power / noise))
 
 
+register_amd_ci(est_time=200, stage="stage-b", runner_config="1-gpu-large-amd")
+
+
 @unittest.skipIf(SKIP is not None, SKIP or "")
 class TestGfx950FusedIndexerKernels(unittest.TestCase):
     @classmethod
@@ -88,12 +62,8 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
 
     # -- node 1 --------------------------------------------------------------
     def test_dual_gemv_matches_torch_mm(self):
-        """One launch, two independent projections; torch.mm is the definition.
-
-        bf16 inputs with fp32 accumulation on both sides, so this is a numerical
-        comparison, not bit equality. The dual GEMV is exercised at every row
-        count it accepts in a single launch.
-        """
+        """One launch, two independent projections; torch.mm on the same operands is
+        the reference."""
         for rows in (1, 2, 4, 8):
             with self.subTest(rows=rows):
                 q_lora = torch.randn(
@@ -116,9 +86,7 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
                 )
                 kw = torch.empty(rows, KW_ROWS, dtype=torch.bfloat16, device=self.dev)
 
-                self.gemv.dual_gemv_bf16(
-                    q_lora, w_q_b, q_proj, x, w_kw, kw, self.loader.DUAL_GEMV_CFG
-                )
+                self.gemv.dual_gemv_bf16(q_lora, w_q_b, q_proj, x, w_kw, kw)
                 torch.cuda.synchronize()
 
                 self.assertGreater(
@@ -127,17 +95,10 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
                 self.assertGreater(_snr_db(x.float() @ w_kw.float().t(), kw), 35.0)
 
     # -- node 4 --------------------------------------------------------------
-    def _fused_logits(self, rows: int, ctx: int):
-        """Produce logits and the paired histogram for the node-4 tests.
-
-        The cache content is synthetic and its numerical meaning is not asserted
-        anywhere -- see the module docstring. What node 4 needs from it is a
-        populated ``logits`` row and the ``ghist`` that node 3 leaves behind,
-        because the two kernels are coupled through that histogram. The fp8
-        values come from ``randn`` rather than random bytes so no NaN patterns
-        enter and the logits stay finite, which is all the selection kernel
-        requires.
-        """
+    def _fused_logits(self, rows: int, ctx: int, pt_width: int = 0):
+        """Logits and the paired histogram from node 3, for the node-4 tests.  The cache
+        content is synthetic; only node 4's selection is asserted, which is sound
+        because both sides of that comparison read the same logits."""
         pages_per_row = ctx // PAGE_SIZE
         total_pages = rows * pages_per_row
         q_fp8 = torch.randn(
@@ -153,6 +114,12 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             .reshape(rows, pages_per_row)
             .contiguous()
         )
+        if pt_width > pages_per_row:
+            # As in a captured graph: the table is as wide as the graph, the row
+            # is as long as seqlens says.  Columns past the row are never read.
+            wide = torch.zeros(rows, pt_width, dtype=torch.int32, device=self.dev)
+            wide[:, :pages_per_row] = page_table_64
+            page_table_64 = wide.contiguous()
         logits = torch.zeros(rows, ctx, dtype=torch.float32, device=self.dev)
         ghist = torch.zeros(
             rows, self.topk_mod.hist_stride(), dtype=torch.int32, device=self.dev
@@ -166,31 +133,22 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             logits,
             ghist,
             self.loader.LOGITS_BLOCKS_PER_ROW,
-            self.loader.LOGITS_HIST_BITS,
             TOPK,
-            self.loader.LOGITS_WARPS,
         )
         torch.cuda.synchronize()
         return logits, ghist, (q_fp8, kv, gate, seqlens, page_table_64, ctx)
 
-    def test_topk_transform_matches_aiter(self):
-        """Node 4 against aiter's dsa_topk_transform on identical logits.
-
-        The two kernels take different page tables by design -- the fused one
-        takes the compact page_size=64 table and derives the physical slot
-        in-kernel as ``pt64[row, p >> 6] * 64 + (p & 63)``, which is the
-        definition of page_table_1 -- so the reference is given the equivalent
-        wide table. Both must therefore return the same physical slots.
-
-        Compared as per-row sets: both select the top-k by score, and neither
-        contract fixes the order among the winners.
-        """
+    def _assert_matches_aiter(self, rows, ctx, pt_width=0):
+        """Node 4 against aiter on identical logits.  The fused kernel derives the slot
+        from the compact table as pt64[row, p >> 6] * 64 + (p & 63), so the reference
+        gets the equivalent wide table.  Compared as sets: neither fixes the order."""
         import aiter
 
-        rows, ctx = 8, 8192
         logits, ghist, (_, _, _, seqlens, page_table_64, _) = self._fused_logits(
-            rows, ctx
+            rows, ctx, pt_width=pt_width
         )
+        if pt_width:
+            self.assertEqual(page_table_64.shape[1], pt_width)
 
         cap = max(TOPK, ctx)
         out = torch.empty(rows, TOPK, dtype=torch.int32, device=self.dev)
@@ -201,15 +159,11 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             out,
             ghist,
             torch.zeros(rows, 32, dtype=torch.int32, device=self.dev),
-            torch.zeros(rows, dtype=torch.int32, device=self.dev),
             torch.empty(rows, cap, dtype=torch.int32, device=self.dev),
             torch.empty(rows, cap, dtype=torch.float32, device=self.dev),
             self.loader.TOPK_G,
             PAGE_SIZE,
         )
-        torch.cuda.synchronize()
-
-        # pt1[row, p] = pt64[row, p >> 6] * 64 + (p & 63)
         page_table_1 = (
             page_table_64.to(torch.int64).repeat_interleave(PAGE_SIZE, dim=1)
             * PAGE_SIZE
@@ -227,20 +181,21 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             got_r = set(out[r].tolist()) - {-1}
             ref_r = set(ref[r].tolist()) - {-1}
             self.assertEqual(
-                len(got_r),
-                min(TOPK, ctx),
-                f"row {r}: fused top-k returned {len(got_r)} distinct slots",
+                len(got_r), min(TOPK, ctx), f"row {r}: {len(got_r)} distinct slots"
             )
-            self.assertEqual(
-                got_r, ref_r, f"row {r}: fused and aiter selected different slots"
-            )
+            self.assertEqual(got_r, ref_r, f"row {r}: different slots from aiter")
+
+    def test_topk_transform_matches_aiter(self):
+        self._assert_matches_aiter(rows=8, ctx=8192)
+
+    def test_topk_transform_at_graph_width(self):
+        """k_scatter is selected on the page-table width, and GLM-5.2 captures wider
+        than the LDS window, so this is the form serving traffic."""
+        self._assert_matches_aiter(rows=8, ctx=8192, pt_width=16384)
 
     def test_topk_transform_restores_its_histogram(self):
-        """The zero-in/zero-out invariant the shared workspace depends on.
-
-        One ``ghist`` serves all 79 layers back to back, so a kernel that leaves
-        it dirty corrupts the next layer rather than failing here.
-        """
+        """The zero-in/zero-out invariant: one ghist serves all 79 layers back to back,
+        so a kernel that leaves it dirty corrupts the next layer, not this test."""
         rows, ctx = 4, 4096
         logits, ghist, (_, _, _, seqlens, page_table_64, _) = self._fused_logits(
             rows, ctx
@@ -253,7 +208,6 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             torch.empty(rows, TOPK, dtype=torch.int32, device=self.dev),
             ghist,
             torch.zeros(rows, 32, dtype=torch.int32, device=self.dev),
-            torch.zeros(rows, dtype=torch.int32, device=self.dev),
             torch.empty(rows, cap, dtype=torch.int32, device=self.dev),
             torch.empty(rows, cap, dtype=torch.float32, device=self.dev),
             self.loader.TOPK_G,
