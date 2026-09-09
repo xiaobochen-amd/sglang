@@ -1,31 +1,6 @@
-// A copy of AITER's `indexer_qk_rope_quant_and_cache_kernel`
-// (source/aiter/csrc/kernels/cache_kernels.cu:1405) with an OPTIONAL inline
-// 128-point Hadamard, so the GLM-5.2 front end can keep `rotate_activation`
-// AND the fusion at the same time.
-// This is a *copy*: aiter itself is untouched.  It includes aiter's own headers
-// (opus/opus.hpp, hip_reduce.h), so `opus::cast<fp8>`, `opus::finfo` and
-// `block_reduce` are literally the same code as the original.
-// Why an inline Hadamard is possible at all
-// -----------------------------------------
-// The op launches grid(num_tokens, n_heads) x block(head_dim=128): one whole
-// 128-dim head lives in ONE workgroup, one element per thread, and the kernel
-// already stages that head in LDS (`q_vals` / `normed`) for the RoPE pair
-// exchange.  A 128-point Hadamard is 7 butterfly rounds over exactly that LDS
-// array -- no extra global traffic at all, on a kernel that is latency-bound.
-// Why it is bit-identical to `fast_hadamard_transform`
-// ----------------------------------------------------
-// The input is a bf16 value (8-bit mantissa) and the butterfly is a strict
-// binary sum/difference tree of depth 7, so every intermediate needs at most
-// 8 + 7 = 15 mantissa bits and is therefore EXACT in fp32 regardless of the
-// stage order.  Ascending and descending stage orders both reproduce
-// `hadamard_transform(x, scale=128**-0.5)` bit-for-bit, with `scale` applied
-// once at the end in fp32 before the bf16 round.
-// Placement.  The baseline applies the Hadamard AFTER the RoPE write-back and
-// BEFORE act_quant, over the full head_dim=128.  RoPE only touches dims 0..63,
-// and H_128 mixes all 128 dims, so H and RoPE do NOT commute -- H must sit
-// between them.  (This is also why H cannot be folded into wq_b's weights at
-// load time: that would place it before RoPE.)  The K side is the same:
-// LayerNorm -> RoPE -> Hadamard -> ue8m0 quant -> cache store.
+// A copy of aiter's indexer_qk_rope_quant_and_cache_kernel with an inline
+// 128-point Hadamard, so the front end keeps rotate_activation and the fusion
+// at once.  aiter is untouched; this includes its headers, so the maths match.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
@@ -45,49 +20,9 @@ constexpr int HEAD_DIM = 128;
 constexpr int ROPE_DIM = 64;
 constexpr int LOG2_HEAD_DIM = 7;
 
-// 7-round Hadamard butterfly over a head held one element per thread.
-__device__ __forceinline__ float hadamard128(float *__restrict__ buf, int dim,
-                                             float v, float scale) {
-#pragma unroll
-  for (int s = 0; s < LOG2_HEAD_DIM - 1; ++s) { // strides 1, 2, 4, 8, 16, 32
-    const int d = 1 << s;
-    const float partner = __shfl_xor(v, d, 64);
-    // (dim & d) == 0 -> this lane holds the "a" of the pair -> a + b
-    v = ((dim & d) == 0) ? (v + partner) : (partner - v);
-  }
-  __syncthreads(); // stride 64: cross-wave
-  buf[dim] = v;
-  __syncthreads();
-  const float partner = buf[dim ^ (HEAD_DIM / 2)];
-  v = ((dim & (HEAD_DIM / 2)) == 0) ? (v + partner) : (partner - v);
-  return v * scale;
-}
-
-// ---------------------------------------------------------------------------
-// The same kernel folded onto ONE 64-lane wavefront.
-// The straightforward 128-thread form costs ~3.2 us of wall over an empty
-// launch of the same grid on a ~100 KB working set.  That is not bandwidth, it
-// is a dependent chain: HEAD_DIM=128 spans two wavefronts, so each of its five
-// `block_reduce` calls and the Hadamard's stride-64 stage has to round-trip
-// through LDS behind a `__syncthreads()`.
-// Fix: give each thread TWO dims -- lane t owns dim t and dim t+64 -- and run a
-// single wavefront per (token, head).  Then
-//   * both halves of every reduction are an independent 64-lane DPP tree, and
-//   * the Hadamard's stride-64 butterfly is a register-local add/sub,
-// so the kernel has ZERO __syncthreads and ZERO LDS.
-// BIT-EXACTNESS vs that 128-thread form (the reason for the odd "two trees then
-// combine" shape).  `block_reduce<float, F, 128>` computes, exactly:
-//     T0 = wave_reduce<64,false>(dims 0..63)      (in lane 63 of wave 0)
-//     T1 = wave_reduce<64,false>(dims 64..127)    (in lane 63 of wave 1)
-//     result = reduce_op(T1, T0)
-// Lane t here holds dim t in the "lo" slot and dim t+64 in the "hi" slot, so
-// wave_reduce over the lo slot reproduces T0 and over the hi slot reproduces T1
-// *operand for operand*, and the combine is written in the same argument order.
-// `threadBroadcast=true` only appends a readlane, which cannot change a value.
-// The Hadamard keeps the identical ascending stage order and identical operand
-// order, and the rope/LayerNorm arithmetic is unchanged.  So this kernel is
-// bit-identical to the 128-thread form, not merely close.
-// ---------------------------------------------------------------------------
+// Folded onto one 64-lane wavefront: lane t owns dim t and t+64, so both halves
+// of every reduction are an independent DPP tree.  Zero LDS, zero syncthreads,
+// and bit-exact against the 128-thread form operand for operand.
 
 constexpr int HALF_DIM = HEAD_DIM / 2; // 64 == one wavefront
 
@@ -139,60 +74,47 @@ __device__ __forceinline__ void hadamard128_wave(float &lo, float &hi, int t,
   hi = nhi * scale;
 }
 
-// KSPLIT: the k-side epilogue (LayerNorm -> rope -> Hadamard -> fp8 -> paged
-// store) is 6 tokens' worth of work, and in the AITER structure it runs at the
-// END of the head_idx==0 blocks -- i.e. strictly serialised behind those
-struct QKArgs {
-  const scalar_t *__restrict__ q;
-  cache_t *__restrict__ q_out;
-  const scalar_t *__restrict__ weights;
-  float *__restrict__ weights_out;
-  const scalar_t *__restrict__ k;
-  cache_t *__restrict__ kv_cache;
-  const int64_t *__restrict__ slot_mapping;
-  const float *__restrict__ norm_weight;
-  const float *__restrict__ norm_bias;
-  const int64_t *__restrict__ positions;
-  const scalar_t *__restrict__ cos_cache;
-  const scalar_t *__restrict__ sin_cache;
-  int n_heads, cache_block_size, cache_stride, max_position;
-  int q_stride_t, q_stride_h, q_out_stride_t, q_out_stride_h;
-  int weights_stride_t, weights_out_stride_t, k_stride_t;
-  int cos_stride0, sin_stride0, quant_block_size;
-  float epsilon, weights_scale, hadamard_scale;
-  bool use_ue8m0_rt, preshuffle_rt, is_neox_rt, compute_all_q_rope_rt;
-};
-
-template <bool HADAMARD, bool KSPLIT, bool SPEC>
-__device__ __forceinline__ void qk_body(const QKArgs &A) {
-  const bool use_ue8m0 = SPEC ? true : A.use_ue8m0_rt;
-  const bool preshuffle = SPEC ? true : A.preshuffle_rt;
-  const bool is_neox = SPEC ? false : A.is_neox_rt;
-  const bool compute_all_q_rope = SPEC ? true : A.compute_all_q_rope_rt;
-  const int qblk = SPEC ? HEAD_DIM : A.quant_block_size;
-  const int n_heads = A.n_heads;
-  const int cache_block_size = A.cache_block_size;
-  const int cache_stride = A.cache_stride;
-  const float epsilon = A.epsilon;
-  const float weights_scale = A.weights_scale;
-  const float hadamard_scale = A.hadamard_scale;
+// The k-side epilogue runs in its own block rather than at the end of the
+// head_idx==0 blocks, where it would serialise behind them.
+__global__ __launch_bounds__(HALF_DIM) void qk_rope_hadamard_quant_kernel(
+    const scalar_t *__restrict__ q, cache_t *__restrict__ q_out,
+    const scalar_t *__restrict__ weights, float *__restrict__ weights_out,
+    const scalar_t *__restrict__ k, cache_t *__restrict__ kv_cache,
+    const int64_t *__restrict__ slot_mapping,
+    const float *__restrict__ norm_weight, const float *__restrict__ norm_bias,
+    const int64_t *__restrict__ positions,
+    const scalar_t *__restrict__ cos_cache,
+    const scalar_t *__restrict__ sin_cache, const int n_heads,
+    const int cache_block_size, const int cache_stride, const int q_stride_t,
+    const int q_stride_h, const int q_out_stride_t, const int q_out_stride_h,
+    const int weights_stride_t, const int weights_out_stride_t,
+    const int k_stride_t, const int cos_stride0, const int sin_stride0,
+    const float epsilon, const float weights_scale, const float hadamard_scale,
+    const int max_position) {
+  constexpr bool use_ue8m0 = true;
+  constexpr bool preshuffle = true;
+  constexpr bool is_neox = false;
+  constexpr bool compute_all_q_rope = true;
+  constexpr int qblk = HEAD_DIM;
   const int64_t token_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int t = threadIdx.x; // owns dim t and dim t + 64
-  const bool do_q = KSPLIT ? (head_idx < n_heads) : true;
-  const bool do_k = KSPLIT ? (head_idx == n_heads) : (head_idx == 0);
+  const bool do_q = head_idx < n_heads;
+  const bool do_k = head_idx == n_heads;
   // num_tokens == gridDim.x by construction, so the bound check is free
-  if (head_idx >= n_heads + (KSPLIT ? 1 : 0))
+  if (head_idx >= n_heads + 1)
     return;
 
-  const int64_t slot_idx = A.slot_mapping[token_idx];
+  const int64_t slot_idx = slot_mapping[token_idx];
   if (!compute_all_q_rope && slot_idx < 0)
     return;
-  int64_t pos = A.positions[token_idx];
-  if (slot_idx < 0)
-    pos = pos < 0 ? 0 : (pos >= A.max_position ? A.max_position - 1 : pos);
-  const scalar_t *cos_ptr = A.cos_cache + pos * A.cos_stride0;
-  const scalar_t *sin_ptr = A.sin_cache + pos * A.sin_stride0;
+  // Clamped unconditionally: pos indexes cos_cache/sin_cache on both branches,
+  // and clamping only the slot_idx < 0 one left the common path free to read at
+  // an arbitrary offset.
+  int64_t pos = positions[token_idx];
+  pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
+  const scalar_t *cos_ptr = cos_cache + pos * cos_stride0;
+  const scalar_t *sin_ptr = sin_cache + pos * sin_stride0;
 
   auto max_func = [](float a, float b) { return fmaxf(a, b); };
   auto sum_func = [](float a, float b) { return a + b; };
@@ -200,15 +122,14 @@ __device__ __forceinline__ void qk_body(const QKArgs &A) {
 
   // ------------------------------- q side ---------------------------------
   if (do_q) {
-    const scalar_t *q_row =
-        A.q + token_idx * A.q_stride_t + head_idx * A.q_stride_h;
+    const scalar_t *q_row = q + token_idx * q_stride_t + head_idx * q_stride_h;
     float lo = static_cast<float>(q_row[t]);
     float hi = static_cast<float>(q_row[t + HALF_DIM]);
 
     float q_amax;
     lo = rope_lo(lo, t, is_neox, cos_ptr, sin_ptr); // dims >=64 untouched
 
-    if constexpr (HADAMARD) {
+    {
       hadamard128_wave(lo, hi, t, hadamard_scale);
       lo = static_cast<float>(static_cast<scalar_t>(lo));
       hi = static_cast<float>(static_cast<scalar_t>(hi));
@@ -224,16 +145,16 @@ __device__ __forceinline__ void qk_body(const QKArgs &A) {
       q_scale = exp2f(ceilf(log2f(q_scale)));
     const float q_inv_scale = 1.0f / q_scale;
     cache_t *qo =
-        A.q_out + token_idx * A.q_out_stride_t + head_idx * A.q_out_stride_h;
+        q_out + token_idx * q_out_stride_t + head_idx * q_out_stride_h;
     qo[t] = opus::cast<cache_t>(lo * q_inv_scale);
     qo[t + HALF_DIM] = opus::cast<cache_t>(hi * q_inv_scale);
     if (t == 0) {
-      const float w = static_cast<float>(
-          A.weights[token_idx * A.weights_stride_t + head_idx]);
+      const float w =
+          static_cast<float>(weights[token_idx * weights_stride_t + head_idx]);
       const float head_scale = rsqrtf(static_cast<float>(n_heads));
       const scalar_t w_head = static_cast<scalar_t>(w * head_scale);
       const float softmax_scale = weights_scale / head_scale;
-      A.weights_out[token_idx * A.weights_out_stride_t + head_idx] =
+      weights_out[token_idx * weights_out_stride_t + head_idx] =
           static_cast<float>(w_head) * q_scale * softmax_scale;
     }
   }
@@ -242,9 +163,7 @@ __device__ __forceinline__ void qk_body(const QKArgs &A) {
     return;
 
   // ------------------------------- k side ---------------------------------
-  const scalar_t *k_row = A.k + token_idx * A.k_stride_t;
-  const float *__restrict__ norm_weight = A.norm_weight;
-  const float *__restrict__ norm_bias = A.norm_bias;
+  const scalar_t *k_row = k + token_idx * k_stride_t;
   float xlo = static_cast<float>(k_row[t]);
   float xhi = static_cast<float>(k_row[t + HALF_DIM]);
 
@@ -267,7 +186,7 @@ __device__ __forceinline__ void qk_body(const QKArgs &A) {
 
   klo = rope_lo(klo, t, is_neox, cos_ptr, sin_ptr);
 
-  if constexpr (HADAMARD) {
+  {
     hadamard128_wave(klo, khi, t, hadamard_scale);
     klo = static_cast<float>(static_cast<scalar_t>(klo));
     khi = static_cast<float>(static_cast<scalar_t>(khi));
@@ -286,7 +205,7 @@ __device__ __forceinline__ void qk_body(const QKArgs &A) {
   if (t == 0) {
     const int64_t dst_scale_idx = page_base + cache_block_size * HEAD_DIM +
                                   block_offset * HEAD_DIM * 4 / qblk;
-    reinterpret_cast<float *>(A.kv_cache)[dst_scale_idx / 4] = k_scale;
+    reinterpret_cast<float *>(kv_cache)[dst_scale_idx / 4] = k_scale;
   }
   const float k_inv_scale = 1.0f / k_scale;
 
@@ -306,74 +225,9 @@ __device__ __forceinline__ void qk_body(const QKArgs &A) {
     } else {
       dst_offset = page_base + block_offset * HEAD_DIM + dim;
     }
-    A.kv_cache[dst_offset] =
+    kv_cache[dst_offset] =
         opus::cast<cache_t>((h == 0 ? klo : khi) * k_inv_scale);
   }
-}
-
-// FAT signature -- 35 arguments, ~232 B of kernarg.  Control for K4.
-template <bool HADAMARD, bool KSPLIT = false, bool SPEC = false>
-__global__ __launch_bounds__(HALF_DIM) void qk_rope_hadamard_quant_kernel(
-    const scalar_t *__restrict__ q, cache_t *__restrict__ q_out,
-    const scalar_t *__restrict__ weights, float *__restrict__ weights_out,
-    const scalar_t *__restrict__ k, cache_t *__restrict__ kv_cache,
-    const int64_t *__restrict__ slot_mapping,
-    const float *__restrict__ norm_weight, const float *__restrict__ norm_bias,
-    const int64_t *__restrict__ positions,
-    const scalar_t *__restrict__ cos_cache,
-    const scalar_t *__restrict__ sin_cache, const int num_tokens,
-    const int n_heads, const int quant_block_size, const int cache_block_size,
-    const int cache_stride, const int64_t q_stride_t, const int64_t q_stride_h,
-    const int64_t q_stride_d, const int64_t q_out_stride_t,
-    const int64_t q_out_stride_h, const int64_t q_out_stride_d,
-    const int64_t weights_stride_t, const int64_t weights_stride_h,
-    const int64_t weights_out_stride_t, const int64_t weights_out_stride_h,
-    const int64_t k_stride_t, const int64_t k_stride_d,
-    const int64_t cos_stride0, const int64_t sin_stride0, const float epsilon,
-    const float weights_scale, const float hadamard_scale, const bool use_ue8m0,
-    const bool preshuffle, const bool is_neox, const int max_position,
-    const bool compute_all_q_rope) {
-  QKArgs A;
-  A.q = q;
-  A.q_out = q_out;
-  A.weights = weights;
-  A.weights_out = weights_out;
-  A.k = k;
-  A.kv_cache = kv_cache;
-  A.slot_mapping = slot_mapping;
-  A.norm_weight = norm_weight;
-  A.norm_bias = norm_bias;
-  A.positions = positions;
-  A.cos_cache = cos_cache;
-  A.sin_cache = sin_cache;
-  A.n_heads = n_heads;
-  A.cache_block_size = cache_block_size;
-  A.cache_stride = cache_stride;
-  A.max_position = max_position;
-  A.q_stride_t = static_cast<int>(q_stride_t);
-  A.q_stride_h = static_cast<int>(q_stride_h);
-  A.q_out_stride_t = static_cast<int>(q_out_stride_t);
-  A.q_out_stride_h = static_cast<int>(q_out_stride_h);
-  A.weights_stride_t = static_cast<int>(weights_stride_t);
-  A.weights_out_stride_t = static_cast<int>(weights_out_stride_t);
-  A.k_stride_t = static_cast<int>(k_stride_t);
-  A.cos_stride0 = static_cast<int>(cos_stride0);
-  A.sin_stride0 = static_cast<int>(sin_stride0);
-  A.quant_block_size = quant_block_size;
-  A.epsilon = epsilon;
-  A.weights_scale = weights_scale;
-  A.hadamard_scale = hadamard_scale;
-  A.use_ue8m0_rt = use_ue8m0;
-  A.preshuffle_rt = preshuffle;
-  A.is_neox_rt = is_neox;
-  A.compute_all_q_rope_rt = compute_all_q_rope;
-  (void)num_tokens;
-  (void)q_stride_d;
-  (void)q_out_stride_d;
-  (void)k_stride_d;
-  (void)weights_stride_h;
-  (void)weights_out_stride_h;
-  qk_body<HADAMARD, KSPLIT, SPEC>(A);
 }
 
 } // namespace
@@ -387,6 +241,13 @@ void indexer_qk_rope_hadamard_quant_and_cache(
     double weights_scale, bool preshuffle, bool is_neox,
     bool compute_all_q_rope, bool hadamard) {
   const int num_tokens = std::min<int>(k.size(0), slot_mapping.size(0));
+  // num_tokens becomes gridDim.x and indexes all six per-token tensors, but
+  // only two of them took part in the min above.
+  TORCH_CHECK(q.size(0) >= num_tokens && q_out.size(0) >= num_tokens &&
+                  weights.size(0) >= num_tokens &&
+                  weights_out.size(0) >= num_tokens &&
+                  positions.size(0) >= num_tokens,
+              "every per-token tensor must have at least num_tokens rows");
   const int head_dim = k.size(1);
   const int n_heads = q.size(1);
   const int rope_dim = cos_cache.size(-1) * 2;
@@ -403,6 +264,11 @@ void indexer_qk_rope_hadamard_quant_and_cache(
                   k.scalar_type() == at::kBFloat16,
               "q/k must be bf16");
   TORCH_CHECK(weights.scalar_type() == at::kBFloat16, "weights must be bf16");
+  // q_out and kv_cache are reinterpret_cast to a 1-byte cache_t and written as
+  // raw fp8; a wider dtype fills half the row and leaves the rest untouched.
+  TORCH_CHECK(q_out.element_size() == 1 && kv_cache.element_size() == 1,
+              "q_out and kv_cache must be 1-byte fp8, got ",
+              q_out.scalar_type(), "/", kv_cache.scalar_type());
   TORCH_CHECK(weights_out.scalar_type() == at::kFloat,
               "weights_out must be fp32");
   TORCH_CHECK(norm_weight.scalar_type() == at::kFloat &&
@@ -439,8 +305,8 @@ void indexer_qk_rope_hadamard_quant_and_cache(
               "wave kernel needs contiguous head dim");
   TORCH_CHECK(weights.stride(1) == 1 && weights_out.stride(1) == 1,
               "wave kernel needs contiguous head axis on weights");
-  // SPEC and the Hadamard are folded into the instantiation; refuse it if the
-  // caller is not actually on that path.
+  // The kernel is written for exactly this configuration, so refuse any call
+  // that is not on it rather than silently computing something else.
   TORCH_CHECK(hadamard, "the fused indexer requires the inline Hadamard");
   TORCH_CHECK(use_ue8m0 && preshuffle && !is_neox && compute_all_q_rope &&
                   quant_block_size == HEAD_DIM,
@@ -448,15 +314,13 @@ void indexer_qk_rope_hadamard_quant_and_cache(
               "compute_all_q_rope + quant_block == 128");
   dim3 wgrid(num_tokens, n_heads + 1);
   dim3 wblock(HALF_DIM);
-  qk_rope_hadamard_quant_kernel<true, true, true><<<wgrid, wblock, 0, stream>>>(
-      qp, qop, wp, wop, kp, cp, sp, nwp, nbp, pp, cosp, sinp, num_tokens,
-      n_heads, static_cast<int>(quant_block_size), cache_block_size,
-      cache_stride, q.stride(0), q.stride(1), q.stride(2), q_out.stride(0),
-      q_out.stride(1), q_out.stride(2), weights.stride(0), weights.stride(1),
-      weights_out.stride(0), weights_out.stride(1), k.stride(0), k.stride(1),
-      cos_cache.stride(0), sin_cache.stride(0), static_cast<float>(epsilon),
-      static_cast<float>(weights_scale), had_scale, use_ue8m0, preshuffle,
-      is_neox, max_position, compute_all_q_rope);
+  qk_rope_hadamard_quant_kernel<<<wgrid, wblock, 0, stream>>>(
+      qp, qop, wp, wop, kp, cp, sp, nwp, nbp, pp, cosp, sinp, n_heads,
+      cache_block_size, cache_stride, (int)q.stride(0), (int)q.stride(1),
+      (int)q_out.stride(0), (int)q_out.stride(1), (int)weights.stride(0),
+      (int)weights_out.stride(0), (int)k.stride(0), (int)cos_cache.stride(0),
+      (int)sin_cache.stride(0), static_cast<float>(epsilon),
+      static_cast<float>(weights_scale), had_scale, max_position);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

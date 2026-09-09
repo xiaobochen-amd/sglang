@@ -1,31 +1,6 @@
-"""gfx950 fused DSA-indexer decode step: 12 launches -> 4 kernels.
-
-Replaces, for one indexer layer of one decode forward:
-
-  wq_b GEMM | wk GEMM | weights_proj GEMM | k_norm | rope | Hadamard(q) |
-  Hadamard(k) | act_quant(q) | indexer_k_quant_and_cache(k) | head gate |
-  paged-MQA fp8 logits | top-k + page transform
-
-with
-
-  dual_gemv_kernel<...,cfg 61> | qk_rope_hadamard_quant_kernel<true,true,true> |
-  logits_hist_m<8,12> | dsa_topk::k_scatter<2,...,16>
-
-Each kernel source ships exactly one instantiation (see the package
-docstring); this module only marshals production tensors into their ABIs and
-owns the persistent workspace. It makes no numerical decision of its own.
-
-CONTRACT PRESERVED, deliberately and non-negotiably:
-  * output is ``(rows, index_topk)`` int32 **physical page_size=1 KV slots**,
-    ``-1`` padded -- identical in meaning to
-    ``dsa_topk_backend._topk_transform_aiter_paged``.  The slot is derived
-    in-kernel from the compact ``real_page_table`` as
-    ``pt64[row, p >> 6] * 64 + (p & 63)``, which is the definition of
-    ``page_table_1``; nothing downstream can distinguish the two.
-  * BF16/FP8 dtypes, the fused Hadamard, the ue8m0 scale format and the
-    preshuffled index-K cache layout are unchanged, so the cache written here is
-    byte-compatible with the cache written by the standard path.
-"""
+"""Marshals production tensors into the four fused kernels' ABIs and owns the
+workspace.  Output matches _topk_transform_aiter_paged exactly: int32
+physical page_size=1 slots, -1 padded, cache byte-compatible."""
 
 from __future__ import annotations
 
@@ -100,16 +75,9 @@ def model_shape_supported(
 
 
 class _Workspace:
-    """Persistent per-Indexer buffers.
-
-    Allocated ONCE, outside any HIP graph capture, at the maximum size the
-    process can ask for (``MAX_ROWS`` x the fixed decode page-table width), so a
-    captured graph never records a pointer from a graph-private pool and no
-    later call can force a reallocation that would invalidate an earlier graph.
-
-    ``ghist`` carries a zero-in / zero-out invariant: the fused ``k_scatter``
-    tail restores it before exiting, so it is zeroed exactly once here.
-    """
+    """Persistent buffers, allocated once outside any capture at the maximum size
+    the process can ask for, so a captured graph never records a graph-private
+    pointer and no later call can force a reallocation."""
 
     def __init__(self, *, device, max_cols: int, fp8_dtype):
         rows = MAX_ROWS
@@ -131,7 +99,6 @@ class _Workspace:
         )
         self.ghist = torch.zeros((rows, gh_stride), dtype=torch.int32, device=device)
         self.cursor = torch.zeros((rows, 32), dtype=torch.int32, device=device)
-        self.cand_cnt = torch.zeros((rows,), dtype=torch.int32, device=device)
         self.cand_idx = torch.empty((rows, cap), dtype=torch.int32, device=device)
         self.cand_val = torch.empty((rows, cap), dtype=torch.float32, device=device)
         # Row-expanded page table: metadata is per request, the kernels index
@@ -141,13 +108,8 @@ class _Workspace:
         )
 
 
-# One workspace per (device, fp8 dtype), shared by every Indexer on that
-# device. The buffers are pure scratch: the layers run back-to-back on the
-# current stream -- this path never uses an alternate stream -- and ``ghist``
-# restores its zero-in/zero-out invariant inside the kernel itself. A per-layer
-# copy therefore bought nothing and multiplied the footprint by the layer count
-# (79 on GLM-5.2: 78 target + 1 draft), which is device memory the rest of the
-# server had already been told was free.
+# One workspace per (device, fp8 dtype), shared by all layers: the buffers are
+# scratch, so per-layer copies would multiply the footprint by 79.
 _WORKSPACES: Dict[Tuple[int, torch.dtype], _Workspace] = {}
 _FRESH_ALLOCATION = False
 
@@ -160,27 +122,9 @@ def _workspace_key(device, fp8_dtype) -> Tuple[int, torch.dtype]:
 
 
 def prealloc_workspace(*, device, max_cols: int, fp8_dtype) -> bool:
-    """Create the shared workspace before the server sizes its memory pools.
-
-    Order matters more than size here. The workspace is device memory, and
-    ``calculate_pool_sizes`` divides whatever ``mem_get_info`` reports at that
-    moment among the KV pools. Taking the workspace afterwards -- on the first
-    non-capture sparse decode, which is far later -- means the pools were sized
-    against memory that no longer exists, and the server spends the rest of the
-    run with no headroom: on GLM-5.2 that showed up as free device memory
-    sitting at 0.6-0.8 GiB for a whole 3600 s window, Triton kernels loading
-    lazily mid-serve because they no longer fit at init, and decode steps
-    running ~2x slower at unchanged clock and 25% lower power -- the GPU
-    stalling on the allocator rather than computing.
-
-    ``consume_fresh_allocation`` patches the consequence (it drops the stale
-    MQA-logits budget so the next prefill re-reads the real figure). This
-    removes the cause. Call it from Indexer construction, which runs while
-    weights load and therefore before any pool is sized.
-
-    Idempotent and shared: the first Indexer allocates, the other 78 reuse.
-    Returns False if a workspace already exists or a capture is in progress.
-    """
+    """Create the shared workspace before the server sizes its memory pools, which
+    divide whatever mem_get_info reports at that moment.  Idempotent; returns
+    False if one exists or a capture is in progress."""
     if torch.cuda.is_current_stream_capturing():
         return False
     key = _workspace_key(device, fp8_dtype)
@@ -204,11 +148,8 @@ def prealloc_workspace(*, device, max_cols: int, fp8_dtype) -> bool:
 
 
 def consume_fresh_allocation() -> bool:
-    """True once after a workspace was allocated, then False.
-
-    Callers use this to drop any cached free-memory reading: the workspace is
-    taken after the server has already sized other buffers against
-    ``torch.cuda.mem_get_info``, so that reading no longer holds.
+    """True once after a workspace was allocated, then False.  The caller uses it
+    to drop a memory budget that was computed before that allocation.
     """
     global _FRESH_ALLOCATION
     fresh, _FRESH_ALLOCATION = _FRESH_ALLOCATION, False
@@ -248,12 +189,9 @@ class Gfx950FusedIndexer:
         return self._const
 
     def ensure_workspace(self, *, device, max_cols: int, fp8_dtype) -> bool:
-        """Allocate the workspace if absent. Returns False if it cannot be used.
-
-        Never allocates during graph capture: a buffer created inside a capture
-        lives in that graph's private pool, and reusing it from a different graph
-        is exactly the stale-mapping hazard this campaign already recorded once.
-        """
+        """Allocate the workspace if absent; False if it cannot be used.  Never
+        allocates during capture: a buffer created inside one lives in that graph's
+        private pool."""
         key = _workspace_key(device, fp8_dtype)
         ws = _WORKSPACES.get(key)
         if ws is not None:
@@ -261,8 +199,7 @@ class Gfx950FusedIndexer:
             if max_cols > ws.max_cols:
                 # Say so once. This refusal turns the whole feature off for the
                 # rest of the run while every other log line still reports it as
-                # enabled, and finding that out cost a full 1800 s A/B that
-                # measured two identical arms.
+                # enabled, so an A/B against it silently measures two identical arms.
                 global _WARNED_TOO_NARROW
                 if not _WARNED_TOO_NARROW:
                     _WARNED_TOO_NARROW = True
@@ -321,10 +258,9 @@ class Gfx950FusedIndexer:
         head_gate = ws.head_gate[:rows]
         logits = ws.logits[:rows, :cols]
 
-        # --- node 1: the two independent projections in one GEMV ------------
-        # oq = q_lora @ wq_b.T  (2048 -> 4096)   ok = x @ [wk ; weights_proj].T
-        # Exact, not an approximation: one GEMV per row, and the slices keep
-        # the stride(0) the binding reads. rows <= 8 stays a single launch.
+        # node 1: oq = q_lora @ wq_b.T and ok = x @ [wk ; weights_proj].T in
+        # one GEMV.  Exact: the slices keep the stride(0) the binding reads,
+        # and rows <= 8 is a single launch.
         for i in range(0, rows, DUAL_GEMV_MAX_M):
             j = min(i + DUAL_GEMV_MAX_M, rows)
             gemv.dual_gemv_bf16(
@@ -334,13 +270,11 @@ class Gfx950FusedIndexer:
                 x[i:j],
                 w_kw,
                 kw[i:j],
-                loader.DUAL_GEMV_CFG,
             )
 
-        # --- node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
-        #             indexer_k_quant_and_cache(k) | head gate ---------------
-        # hadamard=True is the whole point of the separate gfx950 gate; see
-        # dsa/utils.assert_hadamard_preserved.
+        # node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
+        # indexer_k_quant_and_cache(k) | head gate.  hadamard=True is why
+        # gfx950 has its own gate; see dsa/utils.assert_hadamard_preserved.
         qk.indexer_qk_rope_hadamard_quant_and_cache(
             q_proj.view(rows, N_HEADS, HEAD_DIM),
             q_fp8,
@@ -364,6 +298,10 @@ class Gfx950FusedIndexer:
             True,  # hadamard  <-- NOT optional on this path
         )
 
+        # Allocated before node 3, not between the two: logits_hist dirties the
+        # histogram, and an OOM in between would leave it dirty for every later call.
+        out = torch.empty((rows, INDEX_TOPK), dtype=torch.int32, device=logits.device)
+
         # --- node 3: paged MQA fp8 logits + fine histogram + coarse summary --
         logits_mod.logits_hist(
             q_fp8,
@@ -374,16 +312,10 @@ class Gfx950FusedIndexer:
             logits,
             ws.ghist[:rows],
             loader.LOGITS_BLOCKS_PER_ROW,
-            loader.LOGITS_HIST_BITS,
             INDEX_TOPK,
-            loader.LOGITS_WARPS,
         )
 
         # --- node 4: top-k(2048) + page transform, fused refinement ---------
-        # A fresh output tensor per call, matching _topk_transform_aiter_paged:
-        # consumers (cross-layer MTP index share, PD serialisation) may hold a
-        # reference past this layer, so the buffer must not be recycled.
-        out = torch.empty((rows, INDEX_TOPK), dtype=torch.int32, device=logits.device)
         topk_mod.topk_transform(
             logits,
             row_ends_int32,
@@ -391,7 +323,6 @@ class Gfx950FusedIndexer:
             out,
             ws.ghist[:rows],
             ws.cursor[:rows],
-            ws.cand_cnt[:rows],
             ws.cand_idx[:rows],
             ws.cand_val[:rows],
             loader.TOPK_G,
@@ -401,8 +332,13 @@ class Gfx950FusedIndexer:
 
 
 def _rope_2d(rotary_emb, rope_dim: int):
-    """cos/sin as 2-D ``[max_pos, rope_dim // 2]`` bf16 with unit last stride."""
+    """cos/sin as 2-D [max_pos, rope_dim // 2] bf16 with unit last stride.  Both
+    halves are strided views, so contiguous() copies; the pair is cached on the
+    shared rope module rather than copied per layer."""
     half = rope_dim // 2
+    cached = getattr(rotary_emb, "_dsa_fused_rope_2d", None)
+    if cached is not None and cached[0].shape[1] == half:
+        return cached
     cos = getattr(rotary_emb, "cos_cache", None)
     sin = getattr(rotary_emb, "sin_cache", None)
     if cos is None or sin is None:
@@ -413,4 +349,5 @@ def _rope_2d(rotary_emb, rope_dim: int):
     assert cos.dtype == torch.bfloat16 and sin.dtype == torch.bfloat16, (
         "gfx950 fused indexer needs a bf16 rope cache, got " f"{cos.dtype}/{sin.dtype}"
     )
+    rotary_emb._dsa_fused_rope_2d = (cos, sin)
     return cos, sin
