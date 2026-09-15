@@ -31,7 +31,10 @@ QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cu: quant_block_size == head_dim
 # Section A is chunked to it rather than capping the whole path, so larger
 # verify batches stay fused.
 DUAL_GEMV_MAX_M = 8
-MAX_ROWS = 48  # bs 8 x num_draft_tokens 6
+# Raised from 48, which was the batch this path had been validated at rather
+# than a limit any of its kernels imposes: verify rows are 6 x concurrency, so
+# every speculative batch above c8 was rejected and fell back.
+MAX_ROWS = 96  # 6 draft tokens x concurrency up to 16
 
 
 def model_shape_supported(
