@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import (
@@ -175,6 +176,53 @@ def _pad_heads(q: torch.Tensor, heads: int) -> torch.Tensor:
     out = q.new_zeros((q.shape[0], _FLYDSL_H, q.shape[2]))
     out[:, :heads] = q
     return out
+
+
+# One padded-q buffer per (device, dtype), zeroed once at creation.
+#
+# _pad_heads allocates and zeroes [seq, 16, 576] once per layer per step -- 78
+# launches on GLM-5.2, measured 447 us/step in a no-graph kernel trace -- for a
+# region that never stops being zero: rows [heads:16] are written by nobody and
+# read by the kernel. The lower half is fully overwritten on every call, so one
+# buffer serves every layer, on the argument _FLYDSL_DECODE_SCRATCH is built on:
+# the layers run back to back on one stream and the kernel consumes q before the
+# next layer writes it.
+_PAD_HEADS_SCRATCH: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_PAD_HEADS_ENABLED = os.environ.get("SGLANG_PAD_HEADS_SCRATCH", "0") == "1"
+_PAD_HEADS_DTYPES = (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def _pad_heads_scratch(q: torch.Tensor, heads: int):
+    """_pad_heads without the per-call zero fill, or None if unavailable.
+
+    None rather than an allocation under graph capture: a buffer created inside
+    one capture belongs to that graph's pool, so another captured graph would
+    replay reads of memory it never wrote. _pad_heads_prealloc creates it
+    before capture starts; anything it did not cover falls back to _pad_heads.
+    """
+    buf = _PAD_HEADS_SCRATCH.get((q.device, q.dtype))
+    if buf is None or buf.shape[0] < q.shape[0] or buf.shape[2] != q.shape[2]:
+        return None
+    out = buf[: q.shape[0]]
+    out[:, :heads] = q
+    return out
+
+
+def _pad_heads_prealloc(device: torch.device, head_dim: int = 576) -> None:
+    if not _PAD_HEADS_ENABLED or torch.cuda.is_current_stream_capturing():
+        return
+    for dt in _PAD_HEADS_DTYPES:
+        key = (device, dt)
+        if key in _PAD_HEADS_SCRATCH:
+            continue
+        _PAD_HEADS_SCRATCH[key] = torch.zeros(
+            (_FLYDSL_DECODE_MAX_SEQ, _FLYDSL_H, head_dim), dtype=dt, device=device
+        )
+    logger.info(
+        f"[cam] pad-heads scratch armed on {device}: "
+        f"{_FLYDSL_DECODE_MAX_SEQ}x{_FLYDSL_H}x{head_dim}, "
+        f"dtypes={[str(d) for d in _PAD_HEADS_DTYPES]}"
+    )
 
 
 def _flydsl_decode_scratch_prealloc(device: torch.device) -> None:
@@ -1454,6 +1502,7 @@ class DeepseekSparseAttnBackend(
             _flydsl_decode_scratch_prealloc(
                 torch.device("cuda", torch.cuda.current_device())
             )
+            _pad_heads_prealloc(torch.device("cuda", torch.cuda.current_device()))
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -2196,7 +2245,12 @@ class DeepseekSparseAttnBackend(
         # H is fixed at 16: heads sit on the lane index and on the MFMA's M
         # axis, so 8 heads run as 16 with the upper half zeroed and dropped.
         seq, heads = q_all.shape[:2]
-        q_in = q_all if heads == _FLYDSL_H else _pad_heads(q_all, heads)
+        if heads == _FLYDSL_H:
+            q_in = q_all
+        else:
+            q_in = _pad_heads_scratch(q_all, heads) if _PAD_HEADS_ENABLED else None
+            if q_in is None:
+                q_in = _pad_heads(q_all, heads)
 
         out = torch.empty(
             (seq, _FLYDSL_H, layer.v_head_dim),

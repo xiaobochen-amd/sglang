@@ -556,6 +556,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         the sparse (full indexer) graph. Returns None when dual-graph is off."""
         if not getattr(self, "dsa_dual_graph", False):
             return None
+        # Arm "dsa_force_variant": skip the dispatch entirely and take the
+        # named graph. The fallback below costs a blocking d2h .item() per
+        # call -- 0.73 ms here, twice per decode step, 10% of a 14.87 ms step --
+        # and it is reached because this config leaves seq_lens_cpu unset
+        # (needs_cpu_seq_lens is False, so resolve_seq_lens_cpu deliberately
+        # skips the mirror). "sparse" is correct for every batch per the
+        # docstring, so forcing it is safe; it only gives up the dense
+        # fast-path for batches whose kv_len fits in index_topk, which the
+        # 104k-context workload never has. Not a default -- a knob for
+        # measuring what this sync is worth.
+        from sglang.srt.managers.overlap_utils import cam_arm
+
+        _forced = cam_arm("dsa_force_variant", None)
+        if _forced:
+            return _forced
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Host-side mirror (maintained incrementally for plain decode) — no

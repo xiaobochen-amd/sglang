@@ -66,6 +66,33 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 
+# --- runtime arm switch -------------------------------------------------
+# Candidates are toggled from a file rather than compiled in: a code change
+# costs a full server restart (~15 min of import and weight load, plus the tens
+# of minutes the driver needs to release the previous server's ~280 GiB per
+# card), while the measurement window is 150 s. A 2 s-cached read lets one
+# server serve every arm, and lets A/B interleave inside one process, which
+# also removes the per-launch common-mode offset.
+import json as _arm_json
+import os as _arm_os
+import time as _arm_time
+
+_ARM_FILE = _arm_os.environ.get("CAM_ARM_FILE", "/shared_nfs/kyle/cam/_arms.json")
+_ARM_CACHE = {"t": 0.0, "v": {}}
+
+
+def cam_arm(name, default=None):
+    now = _arm_time.time()
+    if now - _ARM_CACHE["t"] > 2.0:
+        try:
+            with open(_ARM_FILE) as f:
+                _ARM_CACHE["v"] = _arm_json.load(f)
+        except Exception:
+            pass
+        _ARM_CACHE["t"] = now
+    return _ARM_CACHE["v"].get(name, default)
+# ------------------------------------------------------------------------
+
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
@@ -467,11 +494,21 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and (self.needs_cpu_seq_lens or cam_arm("blocking_fence", False)):
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                # Scoped to the host-mirror path it was measured on, where the
+                # fence is immediately followed by a blocking seq_lens D2H below.
+                # `blocking_fence` restores it everywhere so both arms can be
+                # measured inside one server run.
                 self.publish_ready.synchronize()
             else:
-                self.publish_ready.wait()
+                # The only consumer is the gather below, so a stream-ordered
+                # fence on the stream that issues it is enough; the host does
+                # not need to see the value. Resolve the stream here (not from a
+                # closure) so the fence lands on the gather's own stream.
+                self.publish_ready.wait(
+                    torch.get_device_module(self.device).current_stream()
+                )
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:

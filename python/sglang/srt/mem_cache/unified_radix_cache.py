@@ -2272,6 +2272,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        # Arm "hicache_poll_every": poll every N scheduler steps instead of
+        # every one. The sync below MIN-all-reduces a CPU int64 tensor across
+        # the eight TP ranks and measures 0.91 ms per step in the c1 trace --
+        # 5.5% of a 16.68 ms step, on the critical path. Polling less often only
+        # delays when a completed write/load becomes visible; the MIN semantics
+        # and the piggybacked digest check are unchanged, so this trades reuse
+        # latency for scheduler latency, not correctness. N=1 is stock.
+        from sglang.srt.managers.overlap_utils import cam_arm
+
+        every = int(cam_arm("hicache_poll_every", 1) or 1)
+        if every > 1:
+            self._cam_poll_tick = getattr(self, "_cam_poll_tick", 0) + 1
+            if self._cam_poll_tick % every:
+                return
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
