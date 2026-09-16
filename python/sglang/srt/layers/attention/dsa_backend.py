@@ -189,6 +189,7 @@ def _pad_heads(q: torch.Tensor, heads: int) -> torch.Tensor:
 # next layer writes it.
 _PAD_HEADS_SCRATCH: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
 _PAD_HEADS_ENABLED = os.environ.get("SGLANG_PAD_HEADS_SCRATCH", "0") == "1"
+_PAD_HEADS_ASSERT = os.environ.get("SGLANG_PAD_HEADS_ASSERT", "0") == "1"
 _PAD_HEADS_DTYPES = (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
@@ -202,8 +203,27 @@ def _pad_heads_scratch(q: torch.Tensor, heads: int):
     """
     buf = _PAD_HEADS_SCRATCH.get((q.device, q.dtype))
     if buf is None or buf.shape[0] < q.shape[0] or buf.shape[2] != q.shape[2]:
-        return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(
+            (max(_FLYDSL_DECODE_MAX_SEQ, q.shape[0]), _FLYDSL_H, q.shape[2]),
+            dtype=q.dtype, device=q.device,
+        )
+        _PAD_HEADS_SCRATCH[(q.device, q.dtype)] = buf
+        logger.info(f"[cam] pad-heads scratch armed lazily {tuple(buf.shape)} {q.dtype}")
     out = buf[: q.shape[0]]
+    if _PAD_HEADS_ASSERT:
+        # The whole change rests on "rows [heads:16] are written by nobody".
+        # That is a claim about code I read, so check it against the code that
+        # runs. Host sync per layer, so eager only -- under capture this would
+        # not even be legal.
+        nz = int(out[:, heads:].count_nonzero())
+        if nz:
+            logger.error(
+                f"[cam] pad-heads upper half DIRTY: {nz} nonzero in "
+                f"[{heads}:{_FLYDSL_H}] of {tuple(out.shape)}"
+            )
+            raise AssertionError("pad-heads scratch upper half was written")
     out[:, :heads] = q
     return out
 
