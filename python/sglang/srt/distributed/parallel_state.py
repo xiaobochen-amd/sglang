@@ -234,6 +234,21 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+
+# Decode-sized 1-stage cutoff for fused AR+RMSNorm. The 1-stage kernel launches
+# one block per token and caps at 80 tokens; the upstream 128 KiB default is
+# 10.7 tokens at K=6144, i.e. 7.5x below that cap, so c2 (12 tokens / 144 KiB)
+# falls to the 2-stage path for no hardware reason. Raising this knob also drops
+# the world_size==8 / 4096<K<=7168 / token_num>=8 override, which the comment
+# there says was measured at K=7168 -- K=6144 was never measured.
+# Deliberately NOT reusing SGLANG_USE_1STAGE_ALLREDUCE: that env also flips
+# _deterministic_collectives_enabled(), so it cannot isolate this one effect.
+# Unset == byte-identical behaviour to upstream.
+_CAM_AR1S_KIB = os.environ.get("CAM_AR1S_MAX_KIB", "")
+_CAM_AR1S_MAX_BYTES = int(_CAM_AR1S_KIB or 128) * 1024
+_CAM_AR1S_TUNED = _CAM_AR1S_KIB != ""
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -812,7 +827,7 @@ class GroupCoordinator:
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            use_1stage_ar = total_bytes <= _CAM_AR1S_MAX_BYTES
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -884,12 +899,13 @@ class GroupCoordinator:
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             token_num = input_.numel() // K
-            use_1stage_ar = total_bytes <= 128 * 1024
+            use_1stage_ar = total_bytes <= _CAM_AR1S_MAX_BYTES
             if (
                 # Keep the default 128 KiB cutoff except for the measured TP=8
                 # K=7168 graph-replay crossover. K=4096 remains on the default
                 # rule because token_num=8/16 still favored 1-stage there.
-                self.world_size == 8
+                not _CAM_AR1S_TUNED
+                and self.world_size == 8
                 and 4096 < K <= 7168
                 and token_num >= 8
                 and use_1stage_ar
