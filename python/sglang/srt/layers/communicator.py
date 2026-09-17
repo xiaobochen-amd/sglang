@@ -988,7 +988,16 @@ class LayerCommunicator:
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
                     and get_moe_a2a_backend().is_none()
-                    and get_exec().comm.enable_aiter_allreduce_fusion
+                    # Must match the consumer in apply_aiter_all_reduce_fusion:
+                    # publishing fusion makes the MoE skip its post-experts
+                    # all-reduce, and the next layer's fallback only reduces over
+                    # the MOE_TP group. Where that group is narrower than the one
+                    # skipped (moe_tp_size == 1 under --ep-size == --tp), a phase
+                    # that publishes and then refuses leaves the activations
+                    # under-reduced with no error raised.
+                    and aiter_all_reduce_fusion_enabled_for(
+                        forward_batch.forward_mode
+                    )
                 )
             )
             and (not self.is_last_layer)
