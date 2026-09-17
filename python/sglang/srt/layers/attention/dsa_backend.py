@@ -190,10 +190,16 @@ def _pad_heads(q: torch.Tensor, heads: int) -> torch.Tensor:
 _PAD_HEADS_SCRATCH: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
 _PAD_HEADS_ENABLED = os.environ.get("SGLANG_PAD_HEADS_SCRATCH", "0") == "1"
 _PAD_HEADS_ASSERT = os.environ.get("SGLANG_PAD_HEADS_ASSERT", "0") == "1"
+# Fold the dtype cast into the pad copy. q arrives bf16 and the kernel wants the
+# KV dtype (fp8_e4m3 here), so the old path walked [seq, heads, 576] twice: once
+# for .to(), once to place it in the padded buffer. copy_ casts on the way in,
+# so one pass does both.
+_PAD_HEADS_FUSE_CAST = os.environ.get("SGLANG_PAD_HEADS_FUSE_CAST", "0") == "1"
+_PAD_HEADS_FUSED_SEEN = set()
 _PAD_HEADS_DTYPES = (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
-def _pad_heads_scratch(q: torch.Tensor, heads: int):
+def _pad_heads_scratch(q: torch.Tensor, heads: int, dst_dtype=None):
     """_pad_heads without the per-call zero fill, or None if unavailable.
 
     None rather than an allocation under graph capture: a buffer created inside
@@ -201,16 +207,17 @@ def _pad_heads_scratch(q: torch.Tensor, heads: int):
     replay reads of memory it never wrote. _pad_heads_prealloc creates it
     before capture starts; anything it did not cover falls back to _pad_heads.
     """
-    buf = _PAD_HEADS_SCRATCH.get((q.device, q.dtype))
+    dt = dst_dtype if dst_dtype is not None else q.dtype
+    buf = _PAD_HEADS_SCRATCH.get((q.device, dt))
     if buf is None or buf.shape[0] < q.shape[0] or buf.shape[2] != q.shape[2]:
         if torch.cuda.is_current_stream_capturing():
             return None
         buf = torch.zeros(
             (max(_FLYDSL_DECODE_MAX_SEQ, q.shape[0]), _FLYDSL_H, q.shape[2]),
-            dtype=q.dtype, device=q.device,
+            dtype=dt, device=q.device,
         )
-        _PAD_HEADS_SCRATCH[(q.device, q.dtype)] = buf
-        logger.info(f"[cam] pad-heads scratch armed lazily {tuple(buf.shape)} {q.dtype}")
+        _PAD_HEADS_SCRATCH[(q.device, dt)] = buf
+        logger.info(f"[cam] pad-heads scratch armed lazily {tuple(buf.shape)} {dt}")
     out = buf[: q.shape[0]]
     if _PAD_HEADS_ASSERT:
         # The whole change rests on "rows [heads:16] are written by nobody".
@@ -224,7 +231,16 @@ def _pad_heads_scratch(q: torch.Tensor, heads: int):
                 f"[{heads}:{_FLYDSL_H}] of {tuple(out.shape)}"
             )
             raise AssertionError("pad-heads scratch upper half was written")
-    out[:, :heads] = q
+    if dt != q.dtype:
+        # Counter, not just a flag: a fused path that silently never runs would
+        # otherwise report as a clean zero.
+        key = (q.device, q.dtype, dt)
+        if key not in _PAD_HEADS_FUSED_SEEN:
+            _PAD_HEADS_FUSED_SEEN.add(key)
+            logger.info(f"[cam] pad-heads fused cast {q.dtype} -> {dt}")
+        out[:, :heads].copy_(q)
+    else:
+        out[:, :heads] = q
     return out
 
 
@@ -2257,7 +2273,8 @@ class DeepseekSparseAttnBackend(
         # Same cast tilelang_sparse_fwd performs at its own entry, so neither
         # backend is handed a cheaper q than the other. Plain .to(): neither
         # kernel takes a q scale, both rely on q's range fitting e4m3.
-        if q_all.dtype != kv_cache.dtype:
+        _fuse_cast = _PAD_HEADS_FUSE_CAST and _PAD_HEADS_ENABLED
+        if q_all.dtype != kv_cache.dtype and not _fuse_cast:
             q_all = q_all.to(kv_cache.dtype)
 
         from aiter.ops.flydsl import flydsl_sparse_mla_decode
@@ -2266,10 +2283,16 @@ class DeepseekSparseAttnBackend(
         # axis, so 8 heads run as 16 with the upper half zeroed and dropped.
         seq, heads = q_all.shape[:2]
         if heads == _FLYDSL_H:
-            q_in = q_all
+            q_in = q_all if q_all.dtype == kv_cache.dtype else q_all.to(kv_cache.dtype)
         else:
-            q_in = _pad_heads_scratch(q_all, heads) if _PAD_HEADS_ENABLED else None
+            q_in = (
+                _pad_heads_scratch(q_all, heads, kv_cache.dtype)
+                if _PAD_HEADS_ENABLED
+                else None
+            )
             if q_in is None:
+                if q_all.dtype != kv_cache.dtype:
+                    q_all = q_all.to(kv_cache.dtype)
                 q_in = _pad_heads(q_all, heads)
 
         out = torch.empty(
