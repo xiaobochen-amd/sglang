@@ -38,7 +38,14 @@ logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
-ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+ENABLE_METRICS_DEVICE_TIMER = (
+    envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+    # Probe: the env is read at import, so a server started by a harness that
+    # passes no env cannot turn it on. The arm file is readable at import too.
+    or __import__("sglang.srt.managers.overlap_utils", fromlist=["cam_arm"]).cam_arm(
+        "device_timer", False
+    )
+)
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -173,9 +180,18 @@ class SchedulerMetricsReporter:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
+            # Probe: same window, split by forward category, so the in-graph GPU
+            # time can be attributed to draft steps vs target-verify vs extend.
+            self._device_timer_window_cat = {}
+            self.fwd_cat = ""
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
+                slot = self._device_timer_window_cat.setdefault(
+                    kwargs.get("category", "?"), [0.0, 0]
+                )
+                slot[0] += kwargs["t"]
+                slot[1] += 1
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
@@ -880,6 +896,7 @@ class SchedulerMetricsReporter:
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            msg += f", fwd cat: {self.fwd_cat}"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -1126,6 +1143,12 @@ class SchedulerMetricsReporter:
             return
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
+        batches = self._device_timer_window_batch_count
+        if batches > 0 and self._device_timer_window_cat:
+            self.fwd_cat = " ".join(
+                f"{k}={v[0]/batches*1e3:.3f}ms/{v[1]/batches:.2f}x"
+                for k, v in sorted(self._device_timer_window_cat.items())
+            )
         if self._device_timer_window_batch_count == 0:
             # Window start: keep the last published value instead of NaN-ing
             # the gauge. Readers sample it asynchronously, and the window
@@ -1134,6 +1157,7 @@ class SchedulerMetricsReporter:
             # when truly stale (_reset_device_timer_window after idle).
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
+            self._device_timer_window_cat = {}
         else:
             cpu_time = now - self._device_timer_window_start
             if cpu_time > 0:
