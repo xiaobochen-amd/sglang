@@ -309,16 +309,28 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # D2H pulls (gated only on publish, off the schedule stream). The private
+        # stream is CUDA-only: it recovers occupancy lost to the WAR barrier (also
+        # CUDA-only).
+        #
+        # ROCm takes `mirror_on_publish` instead: publish() enqueues the mirror
+        # D2H on the publish stream *ahead of* publish_ready, and every HIP
+        # consumer already blocks on that event, so the host copy costs no extra
+        # sync at all. Without it HIP had no cheap mirror on either flag setting
+        # -- needs_cpu_seq_lens=True fell through to the blocking .cpu()
+        # bootstrap, and False left seq_lens_cpu unset, which pushes a blocking
+        # `seq_lens.max().item()` onto the forward stream in every host consumer
+        # that needs a length (the DSA dense/sparse decode graph dispatch).
+        self.mirror_on_publish = _is_hip
+        if _is_cuda or self.mirror_on_publish:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
-            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
         else:
             self.new_seq_lens_cpu_pinned = None
+        if _is_cuda:
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+        else:
             self.fwd_prepare_d2h_stream = None
         # Lazy-inited on the first non-empty stash (peeks tensor shapes); non-spec's is a no-op.
         self._forward_buf_initialized = False
@@ -488,19 +500,32 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        host_saw_publish = False
+        use_publish_mirror = (
+            self.mirror_on_publish
+            and self.new_seq_lens_cpu_pinned is not None
+            and bool(cam_arm("host_seq_lens_mirror", True))
+        )
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip and (self.needs_cpu_seq_lens or cam_arm("blocking_fence", False)):
+            if _is_hip and (
+                self.needs_cpu_seq_lens
+                or use_publish_mirror
+                or cam_arm("blocking_fence", False)
+            ):
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 # Scoped to the host-mirror path it was measured on, where the
                 # fence is immediately followed by a blocking seq_lens D2H below.
                 # `blocking_fence` restores it everywhere so both arms can be
-                # measured inside one server run.
+                # measured inside one server run. The publish mirror needs it
+                # too: the host may only read the pinned copy once the event
+                # that the copy was enqueued ahead of has been observed.
                 self.publish_ready.synchronize()
+                host_saw_publish = True
             else:
                 # The only consumer is the gather below, so a stream-ordered
                 # fence on the stream that issues it is enough; the host does
@@ -510,6 +535,19 @@ class FutureMap:
                     torch.get_device_module(self.device).current_stream()
                 )
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if use_publish_mirror and host_saw_publish:
+            # The mirror D2H was enqueued in publish() before publish_ready, and
+            # the host has now observed that event, so the pinned copy is
+            # complete: no reduction kernel, no stream sync, no D2H of our own.
+            # Serve the mirror regardless of needs_cpu_seq_lens -- opting out of
+            # it never removed the host's need for a length, it only moved the
+            # cost into a blocking per-consumer `.max().item()`.
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -568,6 +606,15 @@ class FutureMap:
                 # visible, so an off-forward-stream publish (PD-decode prebuilt
                 # seeding) cannot drop the in-flight forward's fence.
                 device_module.current_stream().wait_event(self.publish_ready)
+            if self.mirror_on_publish:
+                # Ride the host mirror on the publish stream, after the chained
+                # wait and ahead of the record below: anyone who observes
+                # publish_ready then sees a complete pinned copy of every row,
+                # for free. The copy is a few microseconds of stream time and
+                # never blocks the host.
+                self.new_seq_lens_cpu_pinned.copy_(
+                    self.new_seq_lens_buf, non_blocking=True
+                )
             self.publish_ready.record()
             self._publish_fresh = True
         if publish_confidence:

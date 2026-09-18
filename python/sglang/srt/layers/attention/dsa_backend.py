@@ -195,42 +195,128 @@ _PAD_HEADS_ASSERT = os.environ.get("SGLANG_PAD_HEADS_ASSERT", "0") == "1"
 # for .to(), once to place it in the padded buffer. copy_ casts on the way in,
 # so one pass does both.
 _PAD_HEADS_FUSE_CAST = os.environ.get("SGLANG_PAD_HEADS_FUSE_CAST", "0") == "1"
+# One-pass q build (_flydsl_pad_cast_q). Read once at import, not per layer: this
+# sits on an 84-call-per-step path where even a cached arm lookup is measurable.
+_PAD_HEADS_ONE_PASS = os.environ.get("SGLANG_DSA_Q_ONE_PASS", "1") == "1"
 _PAD_HEADS_FUSED_SEEN = set()
+_PAD_HEADS_ONE_PASS_SEEN = set()
 _PAD_HEADS_DTYPES = (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
-def _pad_heads_scratch(q: torch.Tensor, heads: int, dst_dtype=None):
-    """_pad_heads without the per-call zero fill, or None if unavailable.
+def _pad_heads_buf(
+    tokens: int, head_dim: int, dtype: torch.dtype, device: torch.device
+):
+    """The [tokens, 16, head_dim] prefix of the padded-q scratch, or None.
 
     None rather than an allocation under graph capture: a buffer created inside
     one capture belongs to that graph's pool, so another captured graph would
     replay reads of memory it never wrote. _pad_heads_prealloc creates it
     before capture starts; anything it did not cover falls back to _pad_heads.
     """
-    dt = dst_dtype if dst_dtype is not None else q.dtype
-    buf = _PAD_HEADS_SCRATCH.get((q.device, dt))
-    if buf is None or buf.shape[0] < q.shape[0] or buf.shape[2] != q.shape[2]:
+    buf = _PAD_HEADS_SCRATCH.get((device, dtype))
+    if buf is None or buf.shape[0] < tokens or buf.shape[2] != head_dim:
         if torch.cuda.is_current_stream_capturing():
             return None
         buf = torch.zeros(
-            (max(_FLYDSL_DECODE_MAX_SEQ, q.shape[0]), _FLYDSL_H, q.shape[2]),
-            dtype=dt, device=q.device,
+            (max(_FLYDSL_DECODE_MAX_SEQ, tokens), _FLYDSL_H, head_dim),
+            dtype=dtype, device=device,
         )
-        _PAD_HEADS_SCRATCH[(q.device, dt)] = buf
-        logger.info(f"[cam] pad-heads scratch armed lazily {tuple(buf.shape)} {dt}")
-    out = buf[: q.shape[0]]
+        _PAD_HEADS_SCRATCH[(device, dtype)] = buf
+        logger.info(f"[cam] pad-heads scratch armed lazily {tuple(buf.shape)} {dtype}")
+    return buf[:tokens]
+
+
+def _pad_heads_check_clean(out: torch.Tensor, heads: int) -> None:
+    """The scratch rests on "rows [heads:16] are written by nobody".
+
+    That is a claim about code I read, so check it against the code that runs.
+    Host sync per layer, so eager only -- under capture this would not even be
+    legal.
+    """
+    nz = int(out[:, heads:].count_nonzero())
+    if nz:
+        logger.error(
+            f"[cam] pad-heads upper half DIRTY: {nz} nonzero in "
+            f"[{heads}:{_FLYDSL_H}] of {tuple(out.shape)}"
+        )
+        raise AssertionError("pad-heads scratch upper half was written")
+
+
+def _one_pass_note(reason: str) -> None:
+    """Say once why the one-pass q did or did not apply, and return None.
+
+    A path that silently never runs reports as a clean zero, which reads as
+    "measured, no effect" rather than "never measured".
+    """
+    if reason not in _PAD_HEADS_ONE_PASS_SEEN:
+        _PAD_HEADS_ONE_PASS_SEEN.add(reason)
+        logger.info(f"[cam] pad-heads one-pass: {reason}")
+    return None
+
+
+def _flydsl_pad_cast_q(q_nope, q_rope, dst_dtype: torch.dtype):
+    """q for the FlyDSL sparse-MLA decode built in one pass, or None.
+
+    The kernel takes [T, 16, 576] in the KV dtype with the upper heads zero.
+    Reaching that costs two passes on the speculative-decode path -- a concat
+    into a compact [T, 8, 576], then the strided copy that places it in the
+    padded buffer -- while concat_and_cast_q_fp8_pad writes the active heads of
+    a padded destination straight from q_nope/q_rope. Point it at the scratch
+    and the concat, and its launch, are gone; verify pays this once per layer,
+    78 times a step.
+
+    q reaches this backend already quantized, so the source is normally the KV
+    dtype and the kernel's cast is an identity. That makes the whole thing a
+    byte permutation, which a uint8 view expresses without asking Triton to
+    carry fp8 through a load.
+    """
+    if not _is_hip:
+        return _one_pass_note("not hip")
+    if not _PAD_HEADS_ENABLED:
+        return _one_pass_note("pad-heads scratch off")
+    if not _PAD_HEADS_ONE_PASS:
+        return _one_pass_note("one-pass disabled by env")
+    if q_rope is None:
+        return _one_pass_note("q_rope is None")
+    # The decode gate takes q in the KV format or bf16; anything else would make
+    # it decline and send us down a fallback that wants the unpadded head count.
+    if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return _one_pass_note(f"kv dtype {dst_dtype}")
+    if q_nope.dtype != q_rope.dtype or q_nope.dtype not in (torch.bfloat16, dst_dtype):
+        return _one_pass_note(f"q dtypes {q_nope.dtype}/{q_rope.dtype}")
+    if q_nope.ndim != 3 or q_rope.ndim != 3:
+        return _one_pass_note(f"q ndim {q_nope.ndim}/{q_rope.ndim}")
+    tokens, heads, nope = q_nope.shape
+    rope = q_rope.shape[2]
+    # tl.arange bounds in the fused kernel, plus room for the head padding.
+    if heads > _FLYDSL_H or any(v & (v - 1) for v in (heads, nope, rope)):
+        return _one_pass_note(f"q shape {(tokens, heads, nope)}+{rope}")
+    out = _pad_heads_buf(tokens, nope + rope, dst_dtype, q_nope.device)
+    if out is None:
+        return _one_pass_note("scratch unavailable under capture")
     if _PAD_HEADS_ASSERT:
-        # The whole change rests on "rows [heads:16] are written by nobody".
-        # That is a claim about code I read, so check it against the code that
-        # runs. Host sync per layer, so eager only -- under capture this would
-        # not even be legal.
-        nz = int(out[:, heads:].count_nonzero())
-        if nz:
-            logger.error(
-                f"[cam] pad-heads upper half DIRTY: {nz} nonzero in "
-                f"[{heads}:{_FLYDSL_H}] of {tuple(out.shape)}"
-            )
-            raise AssertionError("pad-heads scratch upper half was written")
+        _pad_heads_check_clean(out, heads)
+    _one_pass_note(f"engaged {tokens}x{heads} -> {_FLYDSL_H} from {q_nope.dtype}")
+    if q_nope.dtype == dst_dtype:
+        concat_and_cast_q_fp8_pad(
+            out.view(torch.uint8),
+            q_nope.view(torch.uint8),
+            q_rope.view(torch.uint8),
+            heads,
+        )
+    else:
+        concat_and_cast_q_fp8_pad(out, q_nope, q_rope, heads)
+    return out
+
+
+def _pad_heads_scratch(q: torch.Tensor, heads: int, dst_dtype=None):
+    """_pad_heads without the per-call zero fill, or None if unavailable."""
+    dt = dst_dtype if dst_dtype is not None else q.dtype
+    out = _pad_heads_buf(q.shape[0], q.shape[2], dt, q.device)
+    if out is None:
+        return None
+    if _PAD_HEADS_ASSERT:
+        _pad_heads_check_clean(out, heads)
     if dt != q.dtype:
         # Counter, not just a flag: a fused path that silently never runs would
         # otherwise report as a clean zero.
@@ -2281,19 +2367,22 @@ class DeepseekSparseAttnBackend(
 
         # H is fixed at 16: heads sit on the lane index and on the MFMA's M
         # axis, so 8 heads run as 16 with the upper half zeroed and dropped.
-        seq, heads = q_all.shape[:2]
-        if heads == _FLYDSL_H:
+        # q may arrive already padded (_flydsl_pad_cast_q), so the head count
+        # the caller wants back comes from the layer, not from q.
+        seq, q_heads = q_all.shape[:2]
+        heads = layer.tp_q_head_num
+        if q_heads == _FLYDSL_H:
             q_in = q_all if q_all.dtype == kv_cache.dtype else q_all.to(kv_cache.dtype)
         else:
             q_in = (
-                _pad_heads_scratch(q_all, heads, kv_cache.dtype)
+                _pad_heads_scratch(q_all, q_heads, kv_cache.dtype)
                 if _PAD_HEADS_ENABLED
                 else None
             )
             if q_in is None:
                 if q_all.dtype != kv_cache.dtype:
                     q_all = q_all.to(kv_cache.dtype)
-                q_in = _pad_heads(q_all, heads)
+                q_in = _pad_heads(q_all, q_heads)
 
         out = torch.empty(
             (seq, _FLYDSL_H, layer.v_head_dim),
@@ -2463,10 +2552,13 @@ class DeepseekSparseAttnBackend(
             # branch adds: the TileLang fallback concatenates the same tensors
             # before calling _forward_tilelang.
             if dsa_impl == "flydsl" and is_speculative_decode:
-                if q_all is None or not _is_hip:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_dec = _flydsl_pad_cast_q(q_nope, q_rope, kv_cache.dtype)
+                if q_dec is None:
+                    if q_all is None or not _is_hip:
+                        q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                    q_dec = q_all
                 out = self._try_flydsl_sparse_mla_decode(
-                    q_all, kv_cache, page_table_1, layer
+                    q_dec, kv_cache, page_table_1, layer
                 )
                 if out is not None:
                     return out
@@ -2786,6 +2878,16 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif self.dsa_decode_impl in ("tilelang", "flydsl"):
+            if self.dsa_decode_impl == "flydsl":
+                # Same one-pass q as the verify path; _sparse_q_all's compact
+                # buffer would only be copied into the padded one again.
+                q_dec = _flydsl_pad_cast_q(q_nope, q_rope, kv_cache.dtype)
+                if q_dec is not None:
+                    out = self._try_flydsl_sparse_mla_decode(
+                        q_dec, kv_cache, page_table_1, layer
+                    )
+                    if out is not None:
+                        return out
             q_all = self._sparse_q_all(q_all, q_nope, q_rope, kv_cache)
             if self.dsa_decode_impl == "flydsl":
                 out = self._try_flydsl_sparse_mla_decode(
