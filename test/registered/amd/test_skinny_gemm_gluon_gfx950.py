@@ -71,9 +71,11 @@ class TestSkinnyGemmGluonGfx950(unittest.TestCase):
         """
         from sglang.kernels.ops.gemm.skinny_gemm_gluon import _TUNED
 
-        for m, n, k in _TUNED:
-            with self.subTest(m=m, n=n, k=k):
-                self._run(m, n, k)
+        for (n, k), rungs in _TUNED.items():
+            for m_max, _ in rungs:
+                m = min(m_max, 48)
+                with self.subTest(m=m, n=n, k=k):
+                    self._run(m, n, k)
 
     def test_split_that_overshoots_k(self):
         """A split count whose rounded slice reaches past K.
@@ -83,8 +85,8 @@ class TestSkinnyGemmGluonGfx950(unittest.TestCase):
         end. They must do nothing rather than read there: EVEN_K holds for this
         shape, so the bounds masks are gone and an unguarded block faults.
         """
-        self._run(6, 3072, 6144, block_n=32, block_k=512, split_k=8)
-        self._run(48, 3072, 6144, block_n=32, block_k=512, split_k=8,
+        self._run(6, 2624, 6144, block_n=32, block_k=512, split_k=8)
+        self._run(48, 2624, 6144, block_n=32, block_k=512, split_k=8,
                   reduce="atomic")
 
     def test_untabulated_shape_falls_back(self):
@@ -95,25 +97,25 @@ class TestSkinnyGemmGluonGfx950(unittest.TestCase):
         """Splitting k is what this kernel has over gemm.tiny_gemm."""
         for split_k in (1, 2, 4, 8):
             with self.subTest(split_k=split_k):
-                self._run(6, 3072, 6144, block_n=64, block_k=128, split_k=split_k)
+                self._run(6, 2624, 6144, block_n=64, block_k=128, split_k=split_k)
 
     def test_fetch_axes_do_not_change_the_result(self):
         """Cache policy and XCD banding move bytes, not arithmetic."""
         for b_cpol in ("", ".cg"):
             for xcd_band in (1, 2, 4):
                 with self.subTest(b_cpol=b_cpol, xcd_band=xcd_band):
-                    self._run(6, 3072, 6144, block_n=64, block_k=128, split_k=4,
+                    self._run(6, 2624, 6144, block_n=64, block_k=128, split_k=4,
                               b_cpol=b_cpol, xcd_band=xcd_band)
 
     def test_k_rot_does_not_change_the_result(self):
         """Every block still visits every k tile, only in a rotated order."""
         for k_rot in (0, 1, 3):
             with self.subTest(k_rot=k_rot):
-                self._run(6, 3072, 6144, block_n=64, block_k=128, split_k=4,
+                self._run(6, 2624, 6144, block_n=64, block_k=128, split_k=4,
                           k_rot=k_rot)
 
     def test_bias(self):
-        self._run(6, 3584, 512, block_n=32, block_k=128, split_k=1, bias=True)
+        self._run(6, 4096, 2048, block_n=32, block_k=128, split_k=1, bias=True)
 
 
 if __name__ == "__main__":

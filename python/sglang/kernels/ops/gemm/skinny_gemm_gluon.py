@@ -375,49 +375,78 @@ def _reduce_splits(partial_ptr, bias_ptr, out_ptr, M, N, stride_ps,
 # the weights rotating so each call pays the fetch a decode step pays. Keyed on
 # (m, n, k) because the choice is not monotonic in any one of them: the same
 # n x k wants split_k = 6 at m = 1 and rows_per_block = 3 at m = 84.
-_TUNED: dict[tuple[int, int, int], dict] = {
-    (1, 3072, 6144): dict(block_n=64, block_k=256, split_k=8, num_warps=4, xcd_band=1),
-    (6, 3072, 6144): dict(block_n=64, block_k=256, split_k=8, num_warps=4, b_cpol=".cg", xcd_band=1),
-    (48, 3072, 6144): dict(block_n=64, block_k=128, split_k=8, num_warps=4, tiles_per_warp=2, b_cpol=".cg", xcd_band=1),
-    (84, 3072, 6144): dict(block_n=32, block_k=128, split_k=6, num_warps=1, tiles_per_warp=2, xcd_band=2),
-    (1, 6144, 1536): dict(block_n=16, block_k=512, split_k=1, num_warps=2, reduce="atomic", xcd_band=1),
-    (6, 6144, 1536): dict(block_n=16, block_k=512, split_k=1, num_warps=2, reduce="atomic", xcd_band=2),
-    (48, 6144, 1536): dict(block_n=32, block_k=256, split_k=1, num_warps=4, reduce="atomic", xcd_band=2),
-    (84, 6144, 1536): dict(block_n=32, block_k=256, split_k=1, num_warps=4, tiles_per_warp=2, reduce="atomic", xcd_band=2),
-    (1, 3584, 512): dict(block_n=16, block_k=512, split_k=6, num_warps=4, xcd_band=1),
-    (6, 3584, 512): dict(block_n=16, block_k=512, split_k=8, num_warps=4, reduce="atomic", xcd_band=1),
-    (48, 3584, 512): dict(block_n=64, block_k=512, split_k=1, num_warps=4, reduce="atomic", xcd_band=1),
-    (84, 3584, 512): dict(block_n=64, block_k=512, split_k=8, num_warps=4, tiles_per_warp=2, xcd_band=1),
-}
-
-
-# How many calls the kernel has taken, per shape. A server run is expected to
-# hit specific shapes a specific number of times; reading this back is a check
-# on whether the routing fired that does not depend on anything being logged.
+# Keyed on (n, k) with an m ladder, not on exact (m, n, k): a decode step walks
+# m through batch x draft tokens -- 6, 12, 18 ... at six draft tokens -- so an
+# exact-triple table rejects most of what the server issues even when the
+# weight shape is one it knows. Each list is ascending in m_max; a call takes
+# the first rung it fits under.
+#
+# The families are what a TP4/EP4 server was observed to issue, recorded at the
+# call site rather than derived: the shapes the AITER commit names are its TP8
+# per-card slices and do not appear here.
+# How many calls the kernel has taken, per shape; a check on whether routing
+# fired that does not depend on anything being logged.
 CALL_COUNTS: dict[tuple[int, int, int], int] = {}
+
+_TUNED: dict[tuple[int, int], list[tuple[int, dict]]] = {
+    # 4096 x 2048 -- the heaviest family, 19472 calls in one observed run.
+    (4096, 2048): [
+        (8, dict(block_n=64, block_k=128, split_k=8, num_warps=4)),
+        (24, dict(block_n=64, block_k=512, split_k=8, num_warps=4, tiles_per_warp=2)),
+        (64, dict(block_n=64, block_k=128, split_k=4, num_warps=4)),
+    ],
+    (2624, 6144): [
+        (8, dict(block_n=32, block_k=512, split_k=8, num_warps=2, b_cpol=".cg")),
+        (24, dict(block_n=32, block_k=256, split_k=6, num_warps=4, tiles_per_warp=2)),
+        (64, dict(block_n=64, block_k=128, split_k=8, num_warps=4, tiles_per_warp=2)),
+    ],
+    # 6144 x 4096 stops at 24: at 48 rows this kernel reads 17.14 us against
+    # torch's 16.57, so letting the gate through there would cost time.
+    (6144, 4096): [
+        (8, dict(block_n=64, block_k=128, split_k=8, num_warps=2, b_cpol=".cg")),
+        (24, dict(block_n=64, block_k=128, split_k=8, num_warps=4, tiles_per_warp=2, b_cpol=".cg")),
+    ],
+    (128, 6144): [
+        (24, dict(block_n=16, block_k=512, split_k=6, num_warps=2)),
+        (64, dict(block_n=16, block_k=512, split_k=8, num_warps=2)),
+    ],
+    (32, 6144): [
+        (24, dict(block_n=16, block_k=256, split_k=8, num_warps=4, b_cpol=".cg")),
+        (64, dict(block_n=16, block_k=256, split_k=8, num_warps=2, b_cpol=".cg")),
+    ],
+    (6144, 3072): [
+        (64, dict(block_n=64, block_k=256, split_k=4, num_warps=4, tiles_per_warp=2)),
+    ],
+    # 6144 x 6144 and 6144 x 12288 are deliberately absent: measured at 1.04x
+    # and 1.09x of torch at the only row count they appear with, so the
+    # incumbent keeps them. Together they are under 1% of the calls.
+}
 
 
 def is_tuned_shape(m: int, n: int, k: int) -> bool:
     """Whether this shape has a measured configuration.
 
-    The caller uses it to keep untuned shapes on the incumbent path: the
-    fallback is correct everywhere but was only ever compared against the
-    incumbent on the shapes in the table.
+    The caller uses it to keep unmeasured shapes on the incumbent: the fallback
+    is correct everywhere but was only compared against the incumbent here.
     """
-    return (m, n, k) in _TUNED
+    rungs = _TUNED.get((n, k))
+    return rungs is not None and m <= rungs[-1][0]
 
 
 def default_config(m: int, n: int, k: int) -> dict:
     """The tuned configuration for a shape, or a conservative fallback.
 
-    A shape with no row falls back to a narrow tile with no K split: that is
-    never the fastest choice but it is the one that stays close to the
-    incumbent across the space, and a decode step cannot afford a tuning probe.
+    A shape with no row falls back to a narrow tile with no K split: never the
+    fastest choice, but the one that stays closest to the incumbent across the
+    space, and a decode step cannot afford a tuning probe.
     """
-    cfg = _TUNED.get((m, n, k))
-    if cfg is not None:
-        return dict(cfg)
-    return dict(block_n=32, block_k=256, split_k=1, num_warps=4)
+    rungs = _TUNED.get((n, k))
+    if rungs is None:
+        return dict(block_n=32, block_k=256, split_k=1, num_warps=4)
+    for m_max, cfg in rungs:
+        if m <= m_max:
+            return dict(cfg)
+    return dict(rungs[-1][1])
 
 
 def skinny_gemm_gluon(
