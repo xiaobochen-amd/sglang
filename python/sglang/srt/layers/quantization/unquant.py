@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -67,10 +68,44 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+# aiter's tuned GEMM keys its table on (N, K) and does not fall back to a
+# neighbour, so a shape the table never saw lands on torch. GLM-5.2 TP8 decode
+# hits one of those 79 times a step -- the MLA q up-projection, (2048, 2048) --
+# and torch serves it at 8.4 us against a 1.05 us weight-bandwidth roofline.
+#
+# aiter's own Triton a16w16 kernel does the same shape in 5.0 us with bitwise
+# identical output at M=1, so what is missing is the routing rather than a
+# kernel. Measured on MI355X at M in {1, 6} over N in [1024, 19360] and K in
+# [1024, 6144], triton/torch by K:
+#
+#   K <= 2048   16 of 16 shapes at M=6 win (0.548 to 0.944), none lose at M=1
+#   K >= 4096   mixed: N <= 2048 loses on split-K, the widest N loses on
+#               bandwidth, the middle wins
+#
+# So the gate is K, not a shape list: a list keyed on (N, K) is what makes the
+# aiter table miss these shapes in the first place, and a different TP split
+# moves every N.
+_A16W16_TRITON_MAX_K = 2048
+
+
+def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether aiter's Triton a16w16 beats what tuned_gemm would pick here."""
+    return (
+        x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.shape[1] <= _A16W16_TRITON_MAX_K
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
 
 
 class Bf16GemmBackend(Enum):
@@ -478,6 +513,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+                return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
