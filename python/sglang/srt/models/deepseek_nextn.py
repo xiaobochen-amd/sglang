@@ -24,7 +24,10 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
+from sglang.kernels.ops.layernorm.fused_eh_norm import (
+    fused_eh_norm,
+    is_supported_fused_eh_norm_hidden_size,
+)
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -44,12 +47,13 @@ from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_t
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -195,7 +199,9 @@ class DeepseekModelNextN(nn.Module):
                     previous_hidden_states = torch.matmul(
                         previous_hidden_states, self.rot_weight
                     )
-                if _is_cuda:
+                if (_is_cuda or _is_hip) and is_supported_fused_eh_norm_hidden_size(
+                    hidden_states.shape[-1]
+                ):
                     eh_input = fused_eh_norm(
                         hidden_states,
                         previous_hidden_states,

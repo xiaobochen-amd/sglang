@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess, row_argmax
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -139,6 +139,26 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+# The split argmax in kernels/ops/speculative/topk1.py breaks ties to the lowest
+# index on every device, which is the property #26358 gated the greedy topk=1
+# proposal out of ROCm for. torch.argmax still does not have it there, so the
+# eager fallback inside those helpers stays CUDA/HIP-only.
+_HAS_SPLIT_ARGMAX = _is_cuda or _is_hip
+
+
+def _proposes_with_rejection_sampling(sampling_info) -> bool:
+    """Does the verify read the draft proposal distribution this batch hands it?
+
+    Only a non-greedy batch does: eagle_utils._verify_uses_greedy commits the
+    target argmax for an all-greedy one, so the softmax / Exp(1) draw / stack /
+    clone that build `draft_probs` for it are dead work. Reads the same field
+    the verify branches on, so the two stay in step.
+    """
+    if not get_spec().speculative_use_rejection_sampling:
+        return False
+    return sampling_info is None or not sampling_info.is_all_greedy
+
 
 
 def _qsa_index_share_requested(hf_config) -> bool:
@@ -301,7 +321,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
-
     def init_token_map(self):
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -692,22 +711,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if get_spec().speculative_use_rejection_sampling:
+        propose_with_rejection_sampling = _proposes_with_rejection_sampling(
+            forward_batch.sampling_info
+        )
+        if propose_with_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         topk1_chain_fits = (
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
         )
-        # Materialize the chain directly only when the CUDA kernel can write
-        # every subsequent column. Other topk=1 paths retain the token list and
-        # assemble it with one final cat instead of launching a copy per step.
+        # Materialize the chain directly only when the split-argmax kernel can
+        # write every subsequent column. Other topk=1 paths retain the token list
+        # and assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
         if (
             topk1_chain_fits
-            and _is_cuda
+            and _HAS_SPLIT_ARGMAX
             and self.hot_token_id is None
-            and not get_spec().speculative_use_rejection_sampling
+            and not propose_with_rejection_sampling
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -747,7 +769,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
-
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
                     if (c := self.draft_runner.canary_manager) is not None
@@ -770,7 +791,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if propose_with_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -778,8 +799,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
-                elif self.topk == 1 and not _is_hip:
-                    if _is_cuda:
+                elif self.topk == 1:
+                    if _HAS_SPLIT_ARGMAX:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -796,7 +817,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info,
-                        get_spec().speculative_use_rejection_sampling,
+                        propose_with_rejection_sampling,
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
@@ -812,7 +833,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
+            if propose_with_rejection_sampling
             else None
         )
 
@@ -1121,18 +1142,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ]
         # Selected-row top-k remains worker-owned for both graph and eager
         # paths; the graph runner only moves the row selection before lm_head.
+        # Unlike the chain inside draft_forward, this seed proposal is not skipped
+        # for an all-greedy batch: it is the one draft_probs row that survives to
+        # the next round, and a batch that picks up a sampled request between the
+        # two would then have no q for its first draft token.
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
             )
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
+        elif self.topk == 1:
+            # #26358 gated ROCm out because torch.argmax ties there corrupt MTP
+            # draft selection; row_argmax breaks ties to the lowest index on the
+            # shapes it splits, and hands the rest back to the same torch call
+            # the draft proposal already falls back to.
+            ret_topk_index = row_argmax(draft_logits_output.next_token_logits)
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:

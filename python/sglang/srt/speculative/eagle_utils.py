@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     verify_tree_greedy_kernel_triton,
 )
 from sglang.kernels.ops.speculative.temperature_softmax import temperature_softmax
+from sglang.kernels.ops.speculative.topk1 import row_argmax
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -806,8 +807,13 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        # One tree row per drafted token keeps the row count at bs *
+        # draft_token_num, which torch reduces with one block per row and leaves
+        # the GPU idle on a vocab-wide row; row_argmax splits the row instead and
+        # falls back to torch above its row limit.
+        target_predict = row_argmax(next_token_logits).reshape(
+            bs, verify_input.draft_token_num
+        )
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
