@@ -9,6 +9,10 @@ import triton
 import triton.language as tl
 
 _BLOCK_SIZE = 1024
+# A top-k pivot is the k-th largest value of the row, so a k-wide prefix
+# contains it by construction. Above this width ranking the prefix stops being
+# cheaper than ranking the row, and the sort path takes over again.
+_PIVOT_PREFIX_LIMIT = 1024
 
 
 @triton.jit
@@ -137,15 +141,23 @@ def top_k_renorm_probs_triton(
 ) -> torch.Tensor:
     """Apply exact top-k thresholding and renormalize each probability row.
 
-    Sorting uses PyTorch's device kernels because a vocabulary-sized in-register
+    Ranking uses PyTorch's device kernels because a vocabulary-sized in-register
     Triton sort does not scale to 100K+ vocabularies. Triton performs the
     bandwidth-heavy masking, partial reduction, and normalization.
+
+    A scalar ``top_k`` -- one k for the whole batch, which is what a batch of
+    greedy requests carries -- bounds the ranking: the pivot is the k-th
+    largest, so a k-wide prefix contains it and the rest of the row never has
+    to be ordered. Nothing can spill past that prefix, unlike a top-p nucleus,
+    so the bound needs no overflow flag read back to the host. Per-row k stays
+    on the full sort, which is the only form that serves every row at once.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
     if batch_size == 0 or vocab_size == 0:
         return probs_fp32
 
+    k_shared = None
     if isinstance(top_k, torch.Tensor):
         top_ks = top_k.to(device=probs.device, dtype=torch.int64).reshape(-1)
         if top_ks.numel() == 1:
@@ -156,15 +168,27 @@ def top_k_renorm_probs_triton(
                 f"{top_ks.numel()} values for {batch_size} rows"
             )
     else:
-        top_ks = torch.full(
-            (batch_size,), int(top_k), device=probs.device, dtype=torch.int64
-        )
+        k_shared = int(top_k)
+        top_ks = None
 
-    # Match FlashInfer's threshold semantics: sort descending, keep the k highest
+    # Match FlashInfer's threshold semantics: rank descending, keep the k highest
     # probabilities, and retain all ties at the pivot.
-    sorted_probs = torch.sort(probs_fp32, dim=-1, descending=True).values
-    cutoff = (top_ks - 1).clamp_(min=0, max=vocab_size - 1)
-    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+    if k_shared is not None and k_shared <= 1:
+        # Greedy: the pivot is the row maximum, and a reduction beats every
+        # form of ranking. Ties at the maximum are retained downstream just as
+        # the sort path retains them.
+        pivots = probs_fp32.amax(dim=-1).contiguous()
+    else:
+        if k_shared is not None and k_shared <= min(_PIVOT_PREFIX_LIMIT, vocab_size):
+            ranked = torch.topk(probs_fp32, k_shared, dim=-1, sorted=True).values
+        else:
+            ranked = torch.sort(probs_fp32, dim=-1, descending=True).values
+        if top_ks is None:
+            top_ks = torch.full(
+                (batch_size,), k_shared, device=probs.device, dtype=torch.int64
+            )
+        cutoff = (top_ks - 1).clamp_(min=0, max=ranked.shape[1] - 1)
+        pivots = ranked.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
 
     return _renorm_from_pivots(probs_fp32, pivots)
 

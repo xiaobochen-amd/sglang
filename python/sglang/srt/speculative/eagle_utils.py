@@ -913,10 +913,17 @@ def eagle_sample(
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
+            # A batch-wide top_k goes in as the scalar it is: expanding it to a
+            # per-row tensor would hide from the renorm that one k serves every
+            # row, which is what lets it bound the pivot search by k.
             target_probs = top_k_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                (
+                    sampling_info.shared_top_k
+                    if sampling_info.shared_top_k is not None
+                    else torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    )
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")

@@ -32,7 +32,7 @@ from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.kernels.ops.speculative.temperature_softmax import temperature_softmax
-from sglang.kernels.ops.speculative.topk1 import row_argmax
+from sglang.kernels.ops.speculative.topk1 import draft_proposal_select, row_argmax
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -193,7 +193,6 @@ def sample_draft_proposal(
     which is what greedy means. Drop that renorm and this stops holding.
     """
     probs = temperature_softmax(next_token_logits, temperatures)
-    topk_p, topk_index = fast_sample(probs, num_samples=1)
     if top_ks is not None:
         # Assert rather than skip on a device mismatch: a host-side top_ks would
         # make this correction silently vanish, and the symptom -- draft accept
@@ -204,9 +203,19 @@ def sample_draft_proposal(
             f"got {top_ks.device}; the caller has to carry the real per-request "
             "top_k, not a host placeholder"
         )
+        if envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+            # One reduction for both arms: the greedy row's argmax and the
+            # sampled row's Gumbel-max draw read the row once together, instead
+            # of the draw being made and then discarded per greedy row.
+            gumbel = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+            topk_p, topk_index = draft_proposal_select(probs, gumbel, top_ks)
+            return probs, topk_p, topk_index
+        topk_p, topk_index = fast_sample(probs, num_samples=1)
         greedy = (top_ks <= 1).view(-1, 1)
         topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
         topk_p = probs.gather(1, topk_index)
+        return probs, topk_p, topk_index
+    topk_p, topk_index = fast_sample(probs, num_samples=1)
     return probs, topk_p, topk_index
 
 

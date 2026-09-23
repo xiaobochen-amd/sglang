@@ -144,6 +144,10 @@ if _use_aiter_gfx95:
 _ABSORB_BMM_DECODE_MAX_M = 256
 _absorb_bmm_num_cu = 0
 
+# Token count above which the fused absorb+RoPE+KV-write kernel stops paying
+# for itself; see _can_fuse_bmm_rope_cat_and_cache for the grid it implies.
+_FUSE_BMM_ROPE_MAX_M = 1024
+
 
 def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     """Tile config for the absorb BMMs at decode M, or None to keep aiter's.
@@ -418,7 +422,9 @@ def _fused_rope_cat_and_cache(
     )
 
 
-def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
+def _can_fuse_bmm_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA, num_tokens: int
+) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
     Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
@@ -427,6 +433,10 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     back to back. Every term below mirrors a branch one of those two would
     otherwise have taken, so the fused path is only chosen where it is exactly
     equivalent.
+
+    That argument is about the grid, and it inverts above a decode batch,
+    hence the token count: the fused grid's one-workgroup-per-token cost
+    overtakes the two unfused launches once the batch leaves decode scale.
 
     The caller adds one more term it alone can see: DCP q replication splits the
     absorb across a different weight, which this kernel does not carry.
@@ -437,6 +447,7 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     """
     return (
         _use_aiter_gfx95
+        and num_tokens <= _FUSE_BMM_ROPE_MAX_M
         and not get_parallel().dcp_enabled
         and attn.w_kc.dtype == torch.float8_e4m3fn
         and attn.rotary_emb is not None
@@ -659,7 +670,7 @@ class DeepseekMLARocmForwardMixin:
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
+            _can_fuse_bmm_rope_cat_and_cache(self, q_nope.shape[0])
         )
 
         if q_replicate_active:

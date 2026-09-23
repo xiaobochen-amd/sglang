@@ -7,6 +7,7 @@ from .paged_mqa_logits import (
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
 )
+from .ragged_mqa_logits import aiter_ragged_mqa_logits
 
 
 def pick_dsl_expand(*args, **kwargs):
@@ -27,6 +28,7 @@ __all__ = [
     "CuteDSLPagedMQALogitsRunner",
     "pick_dsl_expand",
     "aiter_paged_mqa_logits",
+    "aiter_ragged_mqa_logits",
     "cutedsl_paged_mqa_logits",
     "deepgemm_paged_mqa_logits_native",
     "deepgemm_paged_mqa_logits_split",

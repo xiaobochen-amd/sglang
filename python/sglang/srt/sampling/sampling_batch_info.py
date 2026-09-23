@@ -89,6 +89,11 @@ class SamplingBatchInfo:
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
 
+    # The one top_k every request in the batch carries, or None when they
+    # differ. Same reason as the flag above: a renorm handed this scalar can
+    # bound its work by k instead of reading top_ks back off the device.
+    shared_top_k: Optional[int] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -200,6 +205,8 @@ class SamplingBatchInfo:
             },
         )
 
+        distinct_top_ks = {r.sampling_params.top_k for r in reqs}
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -213,6 +220,9 @@ class SamplingBatchInfo:
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             npu_top_k_top_p_eligible=all(
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
+            ),
+            shared_top_k=(
+                next(iter(distinct_top_ks)) if len(distinct_top_ks) == 1 else None
             ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
@@ -510,6 +520,8 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
+        if self.shared_top_k != other.shared_top_k:
+            self.shared_top_k = None
 
         self.adjusted_merge_batch(other)
 

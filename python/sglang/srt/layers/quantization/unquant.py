@@ -94,15 +94,31 @@ if _use_aiter:
 # moves every N.
 _A16W16_TRITON_MAX_K = 2048
 
+# K says which kernel the table has an entry for; the token count says
+# whether that still matters, since torch only loses in the weight-bandwidth-
+# bound regime a decode step lives in, not a thousand-row prefill chunk.
+_A16W16_TRITON_MAX_M = 64
+# Narrow K reads a quarter of the weight bytes per output, so the crossover
+# above sits at a higher token count than the K <= 2048 default does.
+_A16W16_TRITON_NARROW_K = 512
+_A16W16_TRITON_NARROW_K_MAX_M = 512
+
 
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether aiter's Triton a16w16 beats what tuned_gemm would pick here."""
+    if x.dim() != 2 or weight.dim() != 2:
+        return False
+    k = weight.shape[1]
+    max_m = (
+        _A16W16_TRITON_NARROW_K_MAX_M
+        if k <= _A16W16_TRITON_NARROW_K
+        else _A16W16_TRITON_MAX_M
+    )
     return (
-        x.dim() == 2
-        and x.dtype == torch.bfloat16
+        x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
-        and weight.dim() == 2
-        and weight.shape[1] <= _A16W16_TRITON_MAX_K
+        and k <= _A16W16_TRITON_MAX_K
+        and x.shape[0] <= max_m
         and x.is_contiguous()
         and weight.is_contiguous()
     )
