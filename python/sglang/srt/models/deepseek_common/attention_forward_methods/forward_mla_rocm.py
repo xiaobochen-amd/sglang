@@ -369,7 +369,16 @@ def _fused_rope_cat_and_cache(
     )
 
 
-def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
+# Token count above which the fused absorb + RoPE + KV-write kernel stops
+# paying for itself; see _can_fuse_bmm_rope_cat_and_cache for the grid it
+# implies. Measured crossover is near 1600 tokens, so this keeps every decode,
+# verify and draft-extend shape on the fused path with room to spare.
+_FUSE_BMM_ROPE_MAX_M = 1024
+
+
+def _can_fuse_bmm_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA, num_tokens: int = 0
+) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
     Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
@@ -378,6 +387,18 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     back to back. Every term below mirrors a branch one of those two would
     otherwise have taken, so the fused path is only chosen where it is exactly
     equivalent.
+
+    That "fills under half the CUs" argument is about the grid, and it inverts
+    once the batch stops being a decode batch, hence ``num_tokens``. The fused
+    grid is ``QH * cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N)`` workgroups for the BMM
+    plus ``M * QH`` for the RoPE -- one per (token, head), owning 64 elements,
+    whatever M is. At 16 heads per rank a decode step asks for a few hundred
+    workgroups on a 256-CU part, the case the fusion was written for, while a
+    32768-token prefill chunk asks for 540672, 97% of them the 64-element kind.
+    Measured on MI355X at QH=16, the two unfused kernels together take 0.22x the
+    fused one at M=32768, 0.39x at 4096 and 1.28x at 1024, so the crossover sits
+    near 1600 tokens; the KV cache bytes are identical either way, only the
+    absorb changes kernel.
 
     The caller adds one more term it alone can see: DCP q replication splits the
     absorb across a different weight, which this kernel does not carry.
@@ -388,6 +409,7 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     """
     return (
         _use_aiter_gfx95
+        and num_tokens <= _FUSE_BMM_ROPE_MAX_M
         and not get_parallel().dcp_enabled
         and attn.w_kc.dtype == torch.float8_e4m3fn
         and attn.rotary_emb is not None
@@ -610,7 +632,7 @@ class DeepseekMLARocmForwardMixin:
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         fuse_bmm_rope_cache = not q_replicate_active and (
-            _can_fuse_bmm_rope_cat_and_cache(self)
+            _can_fuse_bmm_rope_cat_and_cache(self, q_nope.shape[0])
         )
 
         if q_replicate_active:
