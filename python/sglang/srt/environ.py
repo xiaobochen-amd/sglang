@@ -1582,6 +1582,10 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Pass AMD's paired attention instruction-scheduling hints to the fused
+    # sparse-MLA kernel. They only reorder instructions, so the output is
+    # bit-identical; see _sparse_mla_sched_hint for the per-variant numbers.
+    SGLANG_OPT_SPARSE_MLA_SCHED_HINT = EnvBool(True)
     # Caps the width the fused indexer's workspace is sized for; 0 means no
     # cap. Any cap below max_position_embeddings makes ensure_workspace refuse
     # on every call, since the decode graph's page table is sized to the model.

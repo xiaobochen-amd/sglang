@@ -18,6 +18,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.kvcache.cache_ops import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 
 _ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
 _IS_FNUZ = is_fp8_fnuz()
@@ -254,6 +255,38 @@ def _gfx950_sparse_mla_num_warps(
     base_ctas: int, active_splits: int, num_cu: int
 ) -> int:
     return 2 if base_ctas * active_splits > num_cu else 4
+
+
+@functools.lru_cache(maxsize=None)
+def _sparse_mla_sched_hint() -> str:
+    """AMD instruction-scheduling hints for the fused kernel, or "" for default.
+
+    Both variants only reorder instructions -- ``attention`` puts an iglp group
+    and scheduling barriers around the dots, ``memory-bound-attention`` asks the
+    LLVM scheduler for iterative-ilp -- so the result is bit-identical.
+
+    They are paired because each one alone only helps at one end of the top-k
+    locality range, and which end a request lands on is not known at launch.
+    Measured on MI355X at the production prefill shape (seq 32768, topk 2048,
+    H 16, KV 576 B fp8), against a +-0.5% duplicate-arm band: with the rows
+    L2-resident ``attention`` is 0.954x but ``memory-bound-attention`` 1.040x,
+    with them spread over the whole pool it is the reverse at 1.045x / 0.993x.
+    Together they are 0.949-0.965x over the cache-friendly range and 0.993x at
+    the memory-bound end, i.e. never a loss.
+
+    An unrecognised variant is ignored by the backend, but a Triton without the
+    option at all rejects the keyword, so check for it and fall back to the
+    default schedule rather than failing every launch.
+    """
+    if not envs.SGLANG_OPT_SPARSE_MLA_SCHED_HINT.get():
+        return ""
+    try:
+        from triton.backends.amd.compiler import HIPOptions
+    except ImportError:
+        return ""
+    if "schedule_hint" not in getattr(HIPOptions, "__dataclass_fields__", {}):
+        return ""
+    return "attention,memory-bound-attention"
 
 
 def _page_offsets_fit_i32(num_pages: int, kv_dim: int) -> bool:
@@ -1103,6 +1136,7 @@ def _triton_sparse_mla_fwd_splitk(
         # gate, since narrowing only paid off in this configuration.
         i32_page_safe = _page_offsets_fit_i32(kv.shape[0], kv_dim)
         i32_page_tuned = optimize_gfx950_fp8 and fused_num_warps == 2 and topk >= 2048
+        sched_hint = _sparse_mla_sched_hint() if optimize_gfx950_fp8 else ""
         _sparse_mla_fused_kernel[(seq, n_head_blocks)](
             q_nope,
             q_rope,
@@ -1130,6 +1164,7 @@ def _triton_sparse_mla_fwd_splitk(
             PIPE_STAGES=1 if use_topk_length else 3,
             num_warps=fused_num_warps,
             num_stages=2,
+            **({"schedule_hint": sched_hint} if sched_hint else {}),
         )
         return out.unsqueeze(0)
 
